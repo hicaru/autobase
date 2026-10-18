@@ -17,15 +17,25 @@ Security rules & antipatterns: [`AGENTS.md`](AGENTS.md) — read before changing
 ```bash
 forge build
 forge test                               # fork suite runs only with ETH_RPC_URL (archive node)
-cp .env.example .env                     # fill KEEPER / TOKEN_A / TOKEN_B / POOL_FEE / ETH_RPC_URL / MIN_DEPOSIT_VALUE
-forge script script/Deploy.s.sol --fork-url $ETH_RPC_URL --sender <deployer>          # dry-run (no wallet)
-# live deploy: the tx is signed in your browser wallet — the private key never leaves it.
-# `forge script` has no --browser in foundry 1.5.1, so the live deploy uses `forge create`.
-# Connect the wallet when http://localhost:9545 opens; ETHERSCAN_API_KEY is needed for --verify.
-forge create src/AutoBaseVault.sol:AutoBaseVault --rpc-url $ETH_RPC_URL --browser --verify \
-  --constructor-args $KEEPER 0x1F98431c8aD98523631AE4a59f267346ea31F984 $TOKEN_A $TOKEN_B $POOL_FEE \
-  "(420,1800,8000,600,100,150,3600,3600,$MIN_DEPOSIT_VALUE)"   # same params as Deploy.s.sol; deployer = owner
+cp .env.example .env                     # KEEPER, TOKEN_A, TOKEN_B, POOL_FEE, MIN_DEPOSIT_VALUE
+forge script script/Deploy.s.sol --rpc-url https://eth.bearby.ru --sender <deployer>             # dry-run
+forge script script/Deploy.s.sol --rpc-url https://eth.bearby.ru --sender <deployer> --browser --broadcast
 ```
+
+In the browser wallet, set the network RPC to `https://eth.bearby.ru` (otherwise it sends via its default RPC).
+Verify without an Etherscan key: `forge verify-contract <vault> AutoBaseVault --verifier sourcify --chain 1`.
+
+Constructor: `(keeper, factory, tokenA, tokenB, fee, Params)`, deployer = owner. `Params` (set in `Deploy.s.sol`):
+
+| Field | Value |
+|---|---|
+| `minHalfWidthTicks` / `maxHalfWidthTicks` | 420 / 1800 |
+| `recenterThresholdBps` | 8000 |
+| `twapWindow` | 600 s |
+| `maxTwapDeviationTicks` | 100 |
+| `maxSlippageBps` | 150 |
+| `minRebalanceInterval` / `depositLock` | 1 h / 1 h |
+| `minDepositValue` | `$MIN_DEPOSIT_VALUE` |
 
 ## Keeper bot (`bot/`)
 
