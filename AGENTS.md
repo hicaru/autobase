@@ -14,7 +14,9 @@ Rules for any human or AI agent touching this repository. **Security is the only
 |------|-----|---------|--------------|
 | **owner** | deployer (`Ownable(msg.sender)`; 2-step transfer) | `setKeeper`, `setParams` (bounded), `pause`/`unpause`, emergency `exitPosition` (funds stay in the vault) | withdraw, move or redirect user funds, change the pool |
 | **keeper** | bot on a VPS | `rebalance(minLiquidity, deadline)` only | anything else |
-| **user** | anyone | `deposit(amount0, amount1, minShares, deadline)` → ERC20 shares (`ABLP`); `withdraw(shares, min0, min1, deadline)` → pro-rata token0 + token1 | affect other users' share value |
+| **user** | anyone | `deposit(amount0, amount1, minShares, deadline)` (value ≥ `minDepositValue`) → ERC20 shares (`ABLP`), locked for `depositLock`; `withdraw(shares, min0, min1, deadline)` → pro-rata token0 + token1 | affect other users' share value |
+
+**Owner-set params** (all bounded by constants in `_setParams`): `halfWidthTicks`, `twapWindow` (≥ 5 min), `maxTwapDeviationTicks` (< `maxSlippageBps`), `maxSlippageBps` (≤ 3%), `minRebalanceInterval` (≥ 10 min), `depositLock` (1 min – 1 day), `minDepositValue` (token1 base units, ≥ 1000; e.g. `100000` = 0.1 XAUT).
 
 **Flow**
 1. A user calls `approve` and then `deposit`. Funds sit **idle**, and the vault emits `Deposited`. A plain ERC20 `transfer` to the vault is a donation to all holders and credits nobody.
@@ -28,7 +30,8 @@ src/AutoBaseVault.sol              vault (ERC20 shares, roles, deposit/withdraw,
 src/libraries/RebalanceMath.sol    pure math: tick alignment, range, swap sizing, token0→token1 value
 test/RebalanceMath.t.sol           unit + fuzz
 test/AutoBaseVault.access.t.sol    roles, params bounds, pause, deadlines, callback spoofing (no fork)
-test/AutoBaseVault.fork.t.sol      mainnet fork vs the real pool: flows + attack tests (needs ETH_RPC_URL)
+test/AutoBaseVault.fork.t.sol      mainnet fork vs the real pool: flows, attack tests, fork fuzz (needs ETH_RPC_URL)
+test/AutoBaseVault.invariant.t.sol stateful invariants on the fork: random deposit/withdraw/rebalance/market swaps
 script/Deploy.s.sol                deploy (deployer = owner, pool fixed)
 ```
 
@@ -42,24 +45,28 @@ Anyone can deposit, so assume attackers with flash loans, MEV bots and unlimited
 
 | # | Threat | Mitigation (must never be weakened) |
 |---|--------|-------------------------------------|
-| T1 | **Share-price manipulation** (Gamma-style, 2024): move the pool price, deposit cheaply, withdraw more | Deposit values the vault at **both spot and TWAP** and mints `min(shares_spot, shares_twap)`, so moving the price can only hurt the depositor. Deposit also reverts if `|spot − TWAP| > maxTwapDeviationTicks`. Withdraw is purely pro-rata (no price input). Fork test: `test_attack_depositSandwichIsNotProfitable`. |
+| T1 | **Share-price manipulation** (Gamma-style, 2024): move the pool price, deposit cheaply, withdraw more | Deposit values the vault at **spot, TWAP tick and TWAP tick + 1** (the TWAP tick is floored; the true mean lies between the two) and mints the **minimum**, so moving the price can only hurt the depositor. Deposit also reverts if `|spot − TWAP| > maxTwapDeviationTicks`. Withdraw is purely pro-rata (no price input). Fork tests: `test_attack_depositSandwichIsNotProfitable`, `testFuzz_sandwichNeverProfitable` (full P&L including the attacker's swap costs). |
 | T2 | **First-depositor / inflation attack** (donate to inflate share price, so the victim's shares round to 0) | `DEAD_SHARES` burned to `0x…dEaD` on first deposit, a high `INITIAL_SHARES_PER_UNIT` scale, user `minShares`, and `shares > 0` required. Fork test: `test_attack_inflationViaDonation`. |
-| T3 | **Stale-TWAP arbitrage** (real price moved; TWAP lags) | Same min(spot, TWAP) pricing plus the deviation check on deposit. |
+| T3 | **Stale-TWAP arbitrage** (real price moved; TWAP lags) | Same minimum-over-price-views pricing plus the deviation check on deposit. |
 | T4 | **Unclaimed-fee theft** (deposit before fees are counted, withdraw after) | Every deposit and withdraw first pokes the position (`burn(…, 0)` + `collect`), so fees are in the books before shares are priced. |
 | T5 | **Keeper hot key leaks** | Keeper can call **only** `rebalance()`. It cannot withdraw, set params, set the keeper or choose a recipient. Worst case: a range move once per `minRebalanceInterval` and swaps within `maxSlippageBps` of the TWAP. |
 | T6 | **Sandwich of the rebalance swap** | Spot-vs-TWAP deviation check. Swap `sqrtPriceLimitX96` **and** min-out are derived from the **TWAP**. `maxTwapDeviationTicks < maxSlippageBps`. The bot uses a private mempool. |
 | T7 | **Callback spoofing** | Callback requires `msg.sender == pool` **and** a transient in-flight flag set only by the vault right before `pool.mint` / `pool.swap`. |
 | T8 | **Wrong / malicious pool** | Pool resolved via the canonical factory in the constructor; `immutable` afterwards. |
 | T9 | **Owner compromise** | The owner has **no path to funds**: worst case is pause (withdraw still works), bounded params, or a hostile keeper (bounded as in T5). |
-| T10 | **Exit blocked** | `withdraw` has no `whenNotPaused`, needs no keeper and no oracle. Never add a dependency that can block it. |
+| T10 | **Exit blocked** | `withdraw` has no `whenNotPaused`, needs no keeper and no oracle. The only gate is the caller's **own** post-deposit lock (≤ `MAX_DEPOSIT_LOCK` = 1 day, set only by their own deposit). Never add a dependency that can block it. |
 | T11 | **Token-level risk** | XAUT and WBTC issuers can freeze addresses, including the vault. Disclose this to users. |
+| T12 | **Fee sniping** (deposit a large idle amount right before a big swap, collect a share of its fees, withdraw) | `depositLock`: freshly minted shares can be neither withdrawn nor transferred until `lockedUntil[account]`. The lock is enforced in `_update` (burn and transfer); mint is never blocked, and only an account's own deposit sets its lock. Fork test: `test_attack_feeSnipingBlockedByLock`. |
+| T13 | **Dust / spam deposits** | `minDepositValue`, checked against the **lowest** price view. Fork tests: `test_deposit_revertsBelowMinDeposit`, `test_deposit_minDepositUsesLowerPriceView`. |
+| T14 | **Socialised rebalance swap cost** (a large single-sided deposit forces the vault to swap; price impact and fee are shared by all holders, and an outsider can back-run the swap) | Bounded by `maxSlippageBps` and the TWAP price limit, which also caps the swap per rebalance. Keep `maxSlippageBps` tight for thin pools and monitor `Swapped` events. **Accepted residual risk.** |
+| T15 | **Multi-block TWAP manipulation** (a validator holds a manipulated price for the whole `twapWindow`) | `MIN_TWAP_WINDOW` = 5 min plus the deviation check. Costly against arbitrage, but not impossible. **Accepted residual risk.** Prefer longer windows on thin pools. |
 
 ### Invariants (tests must keep proving these)
 
 - **I1** Funds leave the vault **only** to a share holder in `withdraw` (to `msg.sender`, pro-rata to burned shares) or to `pool` inside a vault-initiated mint/swap callback (exact owed amount).
 - **I2** Neither `owner` nor `keeper` can move funds out of the vault.
 - **I3** A deposit can never increase the value per share of the depositor's shares at the expense of others (shares = min over spot/TWAP, rounded down).
-- **I4** `withdraw` is never blocked by pause, keeper state, or oracle state.
+- **I4** `withdraw` is never blocked by pause, keeper state or oracle state. Only the caller's own deposit lock applies (fork invariant `invariant_withdrawNeverFails`, plus a full exit in `afterInvariant`).
 - **I5** Every swap is bounded by TWAP ± `maxSlippageBps` (price limit) and min-out vs. a TWAP quote.
 - **I6** `params` always satisfy the bounds in `_setParams`.
 - **I7** `totalSupply() > 0` implies `DEAD_SHARES` were minted to `0x…dEaD`.
@@ -72,7 +79,7 @@ Anyone can deposit, so assume attackers with flash loans, MEV bots and unlimited
 1. **No upgradability.** No proxies, no `delegatecall`, no `selfdestruct`, no `CREATE2` redeploy tricks. To fix a bug: pause, `exitPosition`, ask users to withdraw, and deploy a new vault.
 2. **No arbitrary external calls.** No `call(data)` with caller-supplied target or calldata, no multicall, no "execute" escape hatch.
 3. **No new privileged roles**, no widening of keeper or owner powers, and **never any owner path to user funds** (no `rescue`, `sweep`, `skim`, `emergencyWithdraw(to)`, fee recipient, etc.) without explicit approval in the PR description.
-4. **Never use spot price (`slot0`) alone** for anything value-sensitive. Share pricing uses min(spot, TWAP), and swaps use the TWAP. Spot alone is only used for range centering, after the deviation check.
+4. **Never use spot price (`slot0`) alone** for anything value-sensitive. Share pricing uses the minimum over spot, TWAP and TWAP + 1, and swaps use the TWAP. Spot alone is only used for range centering, after the deviation check.
 5. **Never set `sqrtPriceLimitX96` to `MIN_SQRT_RATIO+1` / `MAX_SQRT_RATIO-1`** (i.e. "no limit") on a vault swap.
 6. **Never accept a recipient / `to` argument** in any function. Shares mint to `msg.sender`, withdrawals pay `msg.sender`, and liquidity belongs to `address(this)`.
 7. **Every parameter has hard bounds** defined as `constant`s and checked in the setter. No unbounded `uint` knobs.
@@ -83,7 +90,7 @@ Anyone can deposit, so assume attackers with flash loans, MEV bots and unlimited
 12. **No private keys** in code, `.env`, shell history, or CI. Deploy with `--account <keystore>` or `--ledger`. Never `--private-key`.
 13. **No dependency bumps** (`forge update`, submodule moves) without reviewing the upstream diff and re-running the full fork suite.
 14. **`forge build` runs with `deny = "warnings"`.** Do not silence lints globally. A per-line `// forge-lint: disable-next-line(...)` needs a written justification on the line above.
-15. **Never gate `withdraw`** behind `whenNotPaused`, the keeper, the TWAP or any external condition.
+15. **Never gate `withdraw`** behind `whenNotPaused`, the keeper, the TWAP or any external condition. The only allowed gate is the caller's own deposit lock, capped by `MAX_DEPOSIT_LOCK`.
 16. **Share math changes require attack tests** (sandwich, inflation, rounding) on the fork suite before merge.
 
 ---
@@ -115,7 +122,7 @@ Each entry follows the format **❌ antipattern → why it's dangerous → ✅ d
 - ❌ **One-step `transferOwnership`** → a typo bricks the vault forever → ✅ `Ownable2Step`.
 - ❌ **Keeper can set params / recipient / pool / keeper** → leaked bot key = drained vault → ✅ keeper only calls `rebalance`.
 - ❌ **Unprotected `initialize()`** (proxy pattern) → front-run takeover → ✅ constructor only, no proxies.
-- ❌ **`renounceOwnership` called by mistake** → nobody can pause or rotate a leaked keeper key → ✅ never call it. If you touch ownership, consider overriding it to revert.
+- ❌ **`renounceOwnership` called by mistake** → nobody can pause or rotate a leaked keeper key → ✅ overridden to revert (`RenounceDisabled`). Keep it that way.
 - ❌ **Owner "rescue" / "sweep" functions** for pool tokens → a rug path, even if well-intended → ✅ forbidden (rule 3.3). Donated tokens belong to share holders.
 - ❌ **Same key for owner and keeper** → the T5 mitigation is void → ✅ the deploy script enforces `keeper != deployer`. Deploy from cold storage (Ledger or keystore), never from the bot box.
 
@@ -162,7 +169,11 @@ Each entry follows the format **❌ antipattern → why it's dangerous → ✅ d
 - ❌ **Pricing shares before collecting fees** → depositors steal accrued fees → ✅ poke (`burn 0` + `collect`) first.
 - ❌ **Reading `totalSupply()` after `_mint` / `_burn`** in the same calculation → wrong ratio → ✅ snapshot `supply` before mutating it.
 - ❌ **Withdraw that swaps to a single token** → the exit can be sandwiched and manipulated → ✅ pro-rata in both tokens, no swap.
-- ❌ **Withdraw gated by pause, oracle or keeper** → funds held hostage → ✅ withdraw is unconditional (rule 3.15).
+- ❌ **Withdraw gated by pause, oracle or keeper** → funds held hostage → ✅ withdraw is unconditional except for the caller's own capped lock (rule 3.15).
+- ❌ **No holding period** → deposit, collect fees from someone else's liquidity, exit in the same block → ✅ `depositLock` on both withdraw **and** transfer. Locking only withdraw is bypassable by transferring the shares to a fresh address.
+- ❌ **A lock that third parties can set or extend** (e.g. locking the receiver on transfer, or a "deposit for" function) → griefing / hostage → ✅ only `msg.sender`'s own deposit sets `lockedUntil[msg.sender]`.
+- ❌ **Owner-unbounded lock or min deposit** → a soft rug that traps users → ✅ lock ≤ 1 day. A huge `minDepositValue` only blocks *new* deposits, never exits.
+- ❌ **Min-deposit check at a single (manipulable) price** → dust slips through when spot is pushed → ✅ check the **lowest** price view.
 - ❌ **Share price views (`totalAmounts`) consumed by other protocols** → read-only manipulation → ✅ views are spot-based and informational. Document it; never use them for pricing.
 - ❌ **Mint/burn ratio of liquidity ≠ share ratio** → withdrawer takes more than their slice → ✅ `burnLiquidity = L * shares / supply` (floor), using the same `supply` snapshot.
 
@@ -216,15 +227,28 @@ Each entry follows the format **❌ antipattern → why it's dangerous → ✅ d
 ```bash
 forge build                                  # warnings & lints are errors
 forge fmt --check
-forge test                                   # unit + fuzz (fork suite skips without ETH_RPC_URL)
-ETH_RPC_URL=<archive rpc> forge test         # full suite incl. mainnet fork (pinned block)
+forge test                                   # unit + fuzz (fork + invariant suites skip without ETH_RPC_URL)
+ETH_RPC_URL=<archive rpc> forge test         # full suite incl. mainnet fork, fork fuzz, invariants (pinned block)
+ETH_RPC_URL=<archive rpc> forge test --fuzz-seed <n>   # re-run with different seeds before every release
 forge coverage --ir-minimum                  # coverage report
-slither . --filter-paths lib                 # static analysis (pip install slither-analyzer)
+uvx --from slither-analyzer slither . --filter-paths "lib/|test/|script/" --exclude-informational --exclude-optimization
 
 # deploy (dry-run first!)
 forge script script/Deploy.s.sol --fork-url $ETH_RPC_URL --sender <deployer>
 forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL --account <keystore> --broadcast --verify
 ```
+
+### Reviewed Slither results (false positives; re-review if the code around them changes)
+
+| Detector | Location | Why it is accepted |
+|----------|----------|--------------------|
+| `reentrancy-balance` | `withdraw` | The idle share is computed before burning, by design. Burned/collected amounts are added explicitly from `collect`'s return values. The only external calls go to the immutable canonical pool, under `nonReentrant`. |
+| `reentrancy-benign` / `reentrancy-no-eth` | `_mint`, `_swapGuarded`, `rebalance` | The only state written after a pool call is the transient `_expectingCallback` reset. Everything is under `nonReentrant`. |
+| `divide-before-multiply` | `RebalanceMath.floorTick` | Intentional: aligns a tick down to a multiple of `tickSpacing`. |
+| `incorrect-equality` | `== 0` checks on computed liquidity / amounts | Not balance comparisons, so they can't be manipulated by donations. |
+| `calls-loop` | `deposit` valuation loop | 3 iterations, calls go only to the pool tokens. |
+| `timestamp` | cooldown, deposit lock | Minute/hour granularity; validator skew is irrelevant. |
+| `unused-return` | `slot0` / `positions` / `consult` tuples, `burn(…, 0)` poke, `mint` | Intentionally unused fields. |
 
 ## 7. Definition of done for any change
 

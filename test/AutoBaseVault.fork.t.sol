@@ -8,6 +8,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {IUniswapV3Factory} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Factory.sol";
 import {IUniswapV3Pool} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
+import {OracleLibrary} from "@uniswap/v3-periphery/contracts/libraries/OracleLibrary.sol";
 
 import {AutoBaseVault} from "../src/AutoBaseVault.sol";
 import {RebalanceMath} from "../src/libraries/RebalanceMath.sol";
@@ -46,6 +47,9 @@ contract AutoBaseVaultForkTest is Test {
         assertEq(address(vault.token0()), WBTC); // WBTC < XAUT
         assertEq(vault.owner(), address(this));
         (sqrtRef,,,,,,) = pool.slot0();
+        // Funds for simulated market / attacker swaps; never re-dealt so swap costs can be measured.
+        deal(WBTC, address(this), 1_000e8);
+        deal(XAUT, address(this), 100_000e6);
     }
 
     function _params() internal pure returns (AutoBaseVault.Params memory) {
@@ -54,7 +58,9 @@ contract AutoBaseVaultForkTest is Test {
             twapWindow: 600,
             maxTwapDeviationTicks: 100,
             maxSlippageBps: 150,
-            minRebalanceInterval: 1 hours
+            minRebalanceInterval: 1 hours,
+            depositLock: 1 hours,
+            minDepositValue: 1e4 // 0.01 XAUT
         });
     }
 
@@ -70,7 +76,14 @@ contract AutoBaseVaultForkTest is Test {
         vm.stopPrank();
     }
 
+    /// @dev Waits out the user's post-deposit lock.
+    function _unlock(address user) internal {
+        uint256 until = vault.lockedUntil(user);
+        if (block.timestamp < until) _skip(until - block.timestamp);
+    }
+
     function _withdrawAll(address user) internal returns (uint256 a0, uint256 a1) {
+        _unlock(user);
         uint256 shares = vault.balanceOf(user);
         vm.prank(user);
         (a0, a1) = vault.withdraw(shares, 0, 0, block.timestamp);
@@ -96,11 +109,19 @@ contract AutoBaseVaultForkTest is Test {
 
     /// @dev Moves the pool price to `targetTick` with an external swap (simulates the market / an attacker).
     function _movePrice(int24 targetTick) internal {
+        if (targetTick == _spotTick()) return;
         bool zeroForOne = targetTick < _spotTick();
-        deal(WBTC, address(this), 1_000e8);
-        deal(XAUT, address(this), 100_000e6);
         inSwap = true;
         pool.swap(address(this), zeroForOne, type(int128).max, TickMath.getSqrtRatioAtTick(targetTick), "");
+        inSwap = false;
+    }
+
+    /// @dev Moves the pool price back to an exact sqrt price.
+    function _moveToSqrt(uint160 target) internal {
+        (uint160 sqrtP,,,,,,) = pool.slot0();
+        if (sqrtP == target) return;
+        inSwap = true;
+        pool.swap(address(this), target < sqrtP, type(int128).max, target, "");
         inSwap = false;
     }
 
@@ -144,13 +165,96 @@ contract AutoBaseVaultForkTest is Test {
         vm.stopPrank();
     }
 
-    function test_deposit_revertsWhenDust() public {
-        deal(XAUT, alice, 100);
+    function test_deposit_revertsBelowMinDeposit() public {
+        uint256 amount = _params().minDepositValue - 1;
+        deal(XAUT, alice, amount);
         vm.startPrank(alice);
-        IERC20(XAUT).forceApprove(address(vault), 100);
+        IERC20(XAUT).forceApprove(address(vault), amount);
         vm.expectRevert(AutoBaseVault.DepositTooSmall.selector);
-        vault.deposit(0, 100, 0, block.timestamp);
+        vault.deposit(0, amount, 0, block.timestamp);
         vm.stopPrank();
+    }
+
+    function test_deposit_minDepositChangeableByOwner() public {
+        AutoBaseVault.Params memory p = _params();
+        p.minDepositValue = 1e6; // 1 XAUT
+        vault.setParams(p);
+
+        deal(XAUT, alice, 0.5e6);
+        vm.startPrank(alice);
+        IERC20(XAUT).forceApprove(address(vault), 0.5e6);
+        vm.expectRevert(AutoBaseVault.DepositTooSmall.selector);
+        vault.deposit(0, 0.5e6, 0, block.timestamp);
+        vm.stopPrank();
+
+        assertGt(_deposit(bob, 0, 1e6), 0);
+    }
+
+    function test_deposit_minDepositUsesLowerPriceView() public {
+        _deposit(alice, 0.2e8, 4e6);
+        _skip(1 hours);
+        _movePrice(_spotTick() + 90); // spot values WBTC ~0.9% higher than TWAP
+
+        (int24 twapTick,) = OracleLibrary.consult(address(pool), _params().twapWindow);
+        uint160 sqrtTwap = TickMath.getSqrtRatioAtTick(twapTick);
+        uint256 minValue = _params().minDepositValue;
+        // Binary search: `sats` = smallest WBTC amount worth >= min at TWAP, `lo` = sats - 1.
+        uint256 lo;
+        uint256 sats = 1;
+        while (RebalanceMath.toToken1(sats, sqrtTwap) < minValue) sats *= 2;
+        lo = sats / 2;
+        while (lo + 1 < sats) {
+            uint256 mid = (lo + sats) / 2;
+            if (RebalanceMath.toToken1(mid, sqrtTwap) < minValue) lo = mid;
+            else sats = mid;
+        }
+        (uint160 sqrtSpot,,,,,,) = pool.slot0();
+        assertGe(RebalanceMath.toToken1(lo, sqrtSpot), minValue); // `lo` passes at spot ...
+
+        deal(WBTC, bob, lo + sats);
+        vm.startPrank(bob);
+        IERC20(WBTC).forceApprove(address(vault), lo + sats);
+        vm.expectRevert(AutoBaseVault.DepositTooSmall.selector); // ... but the lower TWAP view rejects it
+        vault.deposit(lo, 0, 0, block.timestamp);
+        assertGt(vault.deposit(sats, 0, 0, block.timestamp), 0);
+        vm.stopPrank();
+    }
+
+    // ------------------------------------------------------------------ deposit lock
+
+    function test_lock_blocksWithdrawAndTransfer() public {
+        uint256 shares = _deposit(alice, 0.2e8, 4e6);
+        uint256 until = vault.lockedUntil(alice);
+        assertEq(until, block.timestamp + _params().depositLock);
+
+        vm.startPrank(alice);
+        vm.expectRevert(abi.encodeWithSelector(AutoBaseVault.SharesLocked.selector, until));
+        vault.withdraw(shares, 0, 0, block.timestamp);
+        vm.expectRevert(abi.encodeWithSelector(AutoBaseVault.SharesLocked.selector, until));
+        // call is expected to revert, so there is no return value to check
+        // forge-lint: disable-next-line(erc20-unchecked-transfer)
+        vault.transfer(bob, shares);
+        vm.stopPrank();
+    }
+
+    function test_lock_expires() public {
+        uint256 shares = _deposit(alice, 0.2e8, 4e6);
+        _skip(_params().depositLock);
+        vm.prank(alice);
+        assertTrue(vault.transfer(bob, shares / 2));
+        vm.prank(bob); // receiver is not locked
+        vault.withdraw(shares / 2, 0, 0, block.timestamp);
+        vm.prank(alice);
+        vault.withdraw(shares - shares / 2, 0, 0, block.timestamp);
+    }
+
+    function test_lock_newDepositRelocks() public {
+        _deposit(alice, 0.2e8, 4e6);
+        _skip(_params().depositLock);
+        _deposit(alice, 0.1e8, 0);
+        vm.prank(alice);
+        vm.expectPartialRevert(AutoBaseVault.SharesLocked.selector);
+        vault.withdraw(1, 0, 0, block.timestamp);
     }
 
     function test_rebalance_deploysIdleDeposits() public {
@@ -285,6 +389,7 @@ contract AutoBaseVaultForkTest is Test {
 
     function test_withdraw_revertsBelowMins() public {
         uint256 shares = _deposit(alice, 0.2e8, 4e6);
+        _unlock(alice);
         vm.prank(alice);
         vm.expectPartialRevert(AutoBaseVault.InsufficientOutput.selector);
         vault.withdraw(shares, type(uint256).max, 0, block.timestamp);
@@ -292,6 +397,7 @@ contract AutoBaseVaultForkTest is Test {
 
     function test_withdraw_revertsWithoutShares() public {
         _deposit(alice, 0.2e8, 4e6);
+        _unlock(alice);
         vm.prank(attacker);
         vm.expectRevert();
         vault.withdraw(1, 0, 0, block.timestamp);
@@ -315,15 +421,27 @@ contract AutoBaseVaultForkTest is Test {
         _deposit(alice, 1e8, 20e6);
         _rebalance();
         _skip(1 hours);
+        _assertSandwichUnprofitable(95, 0, 10e6);
+        _assertSandwichUnprofitable(-95, 0.5e8, 0);
+    }
 
-        // Push spot up to the deviation limit, deposit token1, push back, withdraw.
-        _movePrice(_spotTick() + 95);
-        uint256 shares = _deposit(attacker, 0, 10e6);
-        _movePrice(_spotTick() - 95);
+    /// @dev Attacker pushes spot by `move` ticks, deposits, restores the exact price, waits out the lock and
+    ///      withdraws. Full P&L (deposit/withdraw + manipulation swaps) must be <= 0.
+    function _assertSandwichUnprofitable(int24 move, uint256 dep0, uint256 dep1) internal {
+        (uint160 sqrtStart,,,,,,) = pool.slot0();
+        sqrtRef = sqrtStart; // value everything at the price the attacker restores
+        uint256 before = _value(IERC20(WBTC).balanceOf(address(this)), IERC20(XAUT).balanceOf(address(this)));
+        _movePrice(_spotTick() + move);
+        uint256 shares = _deposit(attacker, dep0, dep1);
+        _moveToSqrt(sqrtStart);
+        uint256 afterSwaps = _value(IERC20(WBTC).balanceOf(address(this)), IERC20(XAUT).balanceOf(address(this)));
+        // Round trip to the exact same price: the swapper can only have paid fees.
+        assertLe(afterSwaps, before, "round trip gained");
+        uint256 swapCost = before - afterSwaps;
+
         (uint256 a0, uint256 a1) = _withdrawAll(attacker);
-
         assertGt(shares, 0);
-        assertLe(_value(a0, a1), 10e6);
+        assertLe(_value(a0, a1), _value(dep0, dep1) + swapCost, "sandwich profitable");
     }
 
     function test_attack_depositBeyondDeviationReverts() public {
@@ -342,7 +460,7 @@ contract AutoBaseVaultForkTest is Test {
 
     function test_attack_inflationViaDonation() public {
         // Attacker makes the smallest allowed first deposit, then donates a large amount.
-        _deposit(attacker, 0, 1_001);
+        _deposit(attacker, 0, _params().minDepositValue);
         deal(XAUT, attacker, 100e6);
         vm.prank(attacker);
         IERC20(XAUT).safeTransfer(address(vault), 100e6);
@@ -351,6 +469,28 @@ contract AutoBaseVaultForkTest is Test {
         assertGt(shares, 0);
         (, uint256 a1) = _withdrawAll(alice);
         assertApproxEqRel(a1, 1e6, 0.01e18); // victim loses < 1%
+    }
+
+    function test_attack_feeSnipingBlockedByLock() public {
+        _deposit(alice, 1e8, 20e6);
+        _rebalance();
+        _skip(1 hours);
+
+        // Attacker sees a big swap coming, deposits a large idle amount right before it ...
+        uint256 shares = _deposit(attacker, 0, 100e6);
+        (uint160 sqrtStart,,,,,,) = pool.slot0();
+        _movePrice(_spotTick() + 90);
+        _moveToSqrt(sqrtStart); // ... fees accrue to the vault position ...
+
+        // ... and cannot withdraw (or move shares) to grab them.
+        vm.startPrank(attacker);
+        vm.expectPartialRevert(AutoBaseVault.SharesLocked.selector);
+        vault.withdraw(shares, 0, 0, block.timestamp);
+        vm.expectPartialRevert(AutoBaseVault.SharesLocked.selector);
+        // call is expected to revert, so there is no return value to check
+        // forge-lint: disable-next-line(erc20-unchecked-transfer)
+        vault.transfer(bob, shares);
+        vm.stopPrank();
     }
 
     function test_attack_callbackSpoofFromRealPool() public {
@@ -378,10 +518,13 @@ contract AutoBaseVaultForkTest is Test {
     function test_exitPosition_keepsFundsInVault() public {
         _deposit(alice, 0.2e8, 4e6);
         _rebalance();
+        uint256 ownerWbtc = IERC20(WBTC).balanceOf(address(this));
+        uint256 ownerXaut = IERC20(XAUT).balanceOf(address(this));
         vault.pause();
         vault.exitPosition();
         assertEq(vault.positionLiquidity(), 0);
-        assertEq(IERC20(WBTC).balanceOf(address(this)), 0);
+        assertEq(IERC20(WBTC).balanceOf(address(this)), ownerWbtc); // nothing reached the owner
+        assertEq(IERC20(XAUT).balanceOf(address(this)), ownerXaut);
 
         (uint256 a0, uint256 a1) = _withdrawAll(alice);
         assertApproxEqRel(_value(a0, a1), _value(0.2e8, 4e6), 0.01e18);
@@ -390,5 +533,53 @@ contract AutoBaseVaultForkTest is Test {
     function test_exitPosition_revertsWithoutPosition() public {
         vm.expectRevert(AutoBaseVault.NothingToDo.selector);
         vault.exitPosition();
+    }
+
+    // ------------------------------------------------------------------ fork fuzz
+
+    /// forge-config: default.fuzz.runs = 40
+    function testFuzz_sandwichNeverProfitable(int24 move, uint256 dep0, uint256 dep1) public {
+        move = int24(bound(move, -95, 95));
+        dep0 = bound(dep0, 0, 2e8);
+        dep1 = bound(dep1, 0, 40e6);
+        vm.assume(_value(dep0, dep1) >= 2 * _params().minDepositValue);
+
+        _deposit(alice, 1e8, 20e6);
+        _rebalance();
+        _skip(1 hours);
+        _assertSandwichUnprofitable(move, dep0, dep1);
+    }
+
+    /// forge-config: default.fuzz.runs = 40
+    function testFuzz_twoUsersFairAndSolvent(uint256 a0, uint256 a1, uint256 b0, uint256 b1) public {
+        a0 = bound(a0, 0, 1e8);
+        a1 = bound(a1, 0, 20e6);
+        b0 = bound(b0, 0, 1e8);
+        b1 = bound(b1, 0, 20e6);
+        vm.assume(_value(a0, a1) >= 1e6 && _value(b0, b1) >= 1e6);
+
+        _deposit(alice, a0, a1);
+        _rebalance();
+        _skip(20 minutes); // let the TWAP absorb the vault's own rebalance swap
+        _deposit(bob, b0, b1);
+        vm.prank(keeper);
+        try vault.rebalance(0, block.timestamp) {} catch {} // may be NothingToDo for tiny deposits
+
+        (uint256 oa0, uint256 oa1) = _withdrawAll(alice);
+        (uint256 ob0, uint256 ob1) = _withdrawAll(bob);
+        uint256 inA = _value(a0, a1);
+        uint256 inB = _value(b0, b1);
+        uint256 outA = _value(oa0, oa1);
+        uint256 outB = _value(ob0, ob1);
+
+        // Each user keeps >= 97% (pool fee + bounded swap impact), and nobody creates value from nothing.
+        assertGe(outA, inA * 97 / 100, "alice lost too much");
+        assertGe(outB, inB * 97 / 100, "bob lost too much");
+        assertLe(outA + outB, inA + inB, "value created");
+
+        // Solvency: only dead-share dust remains.
+        (uint256 r0, uint256 r1) = vault.totalAmounts(); // idle + position
+        assertLe(_value(r0, r1), (inA + inB) / 1000 + 1e4, "residual too large");
+        assertEq(vault.totalSupply(), vault.DEAD_SHARES());
     }
 }

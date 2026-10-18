@@ -44,7 +44,9 @@ contract AutoBaseVaultAccessTest is Test {
             twapWindow: 600,
             maxTwapDeviationTicks: 100,
             maxSlippageBps: 150,
-            minRebalanceInterval: 1 hours
+            minRebalanceInterval: 1 hours,
+            depositLock: 1 hours,
+            minDepositValue: 1e4
         });
     }
 
@@ -123,6 +125,23 @@ contract AutoBaseVaultAccessTest is Test {
 
     // ---------------- params bounds ----------------
 
+    function test_setParams_updatesMinDeposit() public {
+        AutoBaseVault.Params memory p = defaultParams();
+        p.minDepositValue = 5e6;
+        vault.setParams(p);
+        (,,,,,, uint128 minDeposit) = vault.params();
+        assertEq(minDeposit, 5e6);
+    }
+
+    function test_renounceOwnership_disabled() public {
+        vm.expectRevert(AutoBaseVault.RenounceDisabled.selector);
+        vault.renounceOwnership();
+        assertEq(vault.owner(), address(this));
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        vault.renounceOwnership();
+    }
+
     function test_setParams_bounds() public {
         AutoBaseVault.Params memory p;
 
@@ -158,6 +177,15 @@ contract AutoBaseVaultAccessTest is Test {
         _expectInvalid(p);
         p = defaultParams();
         p.minRebalanceInterval = vault.MAX_REBALANCE_INTERVAL() + 1;
+        _expectInvalid(p);
+        p = defaultParams();
+        p.depositLock = vault.MIN_DEPOSIT_LOCK() - 1;
+        _expectInvalid(p);
+        p = defaultParams();
+        p.depositLock = vault.MAX_DEPOSIT_LOCK() + 1;
+        _expectInvalid(p);
+        p = defaultParams();
+        p.minDepositValue = vault.MIN_DEPOSIT_VALUE_FLOOR() - 1;
         _expectInvalid(p);
     }
 

@@ -48,17 +48,26 @@ contract AutoBaseVault is
         uint16 maxSlippageBps;
         /// @dev Cooldown between range moves.
         uint32 minRebalanceInterval;
+        /// @dev Seconds a depositor's shares stay non-withdrawable / non-transferable after a deposit
+        ///      (blocks deposit -> collect fees -> withdraw fee sniping).
+        uint32 depositLock;
+        /// @dev Minimum deposit value in token1 base units (anti-spam / anti-dust).
+        uint128 minDepositValue;
     }
 
     uint256 internal constant BPS = 10_000;
     int24 public constant MIN_HALF_WIDTH = 10;
     int24 public constant MAX_HALF_WIDTH = 100_000;
-    uint32 public constant MIN_TWAP_WINDOW = 60;
+    uint32 public constant MIN_TWAP_WINDOW = 5 minutes;
     uint32 public constant MAX_TWAP_WINDOW = 1 hours;
     int24 public constant MAX_TWAP_DEVIATION = 1_000;
-    uint16 public constant MAX_SLIPPAGE_BPS = 500;
-    uint32 public constant MIN_REBALANCE_INTERVAL = 1 minutes;
+    uint16 public constant MAX_SLIPPAGE_BPS = 300;
+    uint32 public constant MIN_REBALANCE_INTERVAL = 10 minutes;
     uint32 public constant MAX_REBALANCE_INTERVAL = 7 days;
+    uint32 public constant MIN_DEPOSIT_LOCK = 1 minutes;
+    uint32 public constant MAX_DEPOSIT_LOCK = 1 days;
+    /// @dev Floor for `minDepositValue`; equals the value burned as DEAD_SHARES.
+    uint128 public constant MIN_DEPOSIT_VALUE_FLOOR = 1_000;
     /// @dev Shares minted per unit of first-deposit value (value is in token1 base units).
     uint256 public constant INITIAL_SHARES_PER_UNIT = 1e6;
     /// @dev Shares burned to a dead address on first deposit (inflation-attack mitigation).
@@ -81,6 +90,8 @@ contract AutoBaseVault is
     int24 public tickLower;
     int24 public tickUpper;
     uint256 public lastRebalance;
+    /// @notice Timestamp until which an account's shares cannot be withdrawn or transferred.
+    mapping(address account => uint256) public lockedUntil;
 
     /// @dev Set only while this contract is inside a pool.mint / pool.swap call it initiated.
     bool private transient _expectingCallback;
@@ -115,6 +126,8 @@ contract AutoBaseVault is
     error InsufficientShares(uint256 shares, uint256 minShares);
     error InsufficientOutput(uint256 amount0, uint256 amount1);
     error DepositTooSmall();
+    error SharesLocked(uint256 until);
+    error RenounceDisabled();
     error UnauthorizedCallback();
 
     modifier onlyKeeper() {
@@ -169,14 +182,19 @@ contract AutoBaseVault is
         _unpause();
     }
 
+    /// @notice Disabled: without an owner nobody could pause or rotate a leaked keeper key.
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
+    }
+
     /// @notice Emergency: burns the whole position into idle balances inside the vault (funds never leave).
     function exitPosition() external onlyOwner nonReentrant {
         int24 lower = tickLower;
         int24 upper = tickUpper;
         if (_positionLiquidity() == 0) revert NothingToDo();
-        (uint256 amount0, uint256 amount1,,) = _burnAndCollect(lower, upper);
         tickLower = 0;
         tickUpper = 0;
+        (uint256 amount0, uint256 amount1,,) = _burnAndCollect(lower, upper);
         emit PositionExited(lower, upper, amount0, amount1);
     }
 
@@ -186,8 +204,9 @@ contract AutoBaseVault is
 
     /// @notice Deposits token0 and/or token1 (requires prior `approve`) and mints shares to the caller.
     ///         Funds stay idle until the next `rebalance()`.
-    /// @dev Shares are priced at both spot and TWAP and the depositor gets the lower amount, so moving the
-    ///      pool price can only hurt the depositor, never existing holders.
+    /// @dev Shares are priced at spot, at the TWAP tick and at TWAP tick + 1 (the true mean price lies in
+    ///      between, as the TWAP tick is floored); the depositor gets the lowest amount, so moving the pool
+    ///      price can only hurt the depositor, never existing holders.
     function deposit(uint256 amount0, uint256 amount1, uint256 minShares, uint256 deadline)
         external
         whenNotPaused
@@ -196,40 +215,30 @@ contract AutoBaseVault is
         returns (uint256 shares)
     {
         if (amount0 == 0 && amount1 == 0) revert ZeroAmount();
-        (uint160 sqrtSpot, uint160 sqrtTwap) = _checkedPrices();
+        uint160[3] memory prices = _checkedPrices();
         _collectFees();
 
-        // Vault holdings before the deposit, valued at both prices.
+        // Vault holdings before the deposit, valued at every price view.
         uint128 liquidity = _positionLiquidity();
-        uint256 valueSpot = _totalValue(sqrtSpot, liquidity);
-        uint256 valueTwap = _totalValue(sqrtTwap, liquidity);
+        uint256[3] memory values;
+        for (uint256 i; i < 3; ++i) {
+            values[i] = _totalValue(prices[i], liquidity);
+        }
 
         uint256 received0 = _pull(token0, amount0);
         uint256 received1 = _pull(token1, amount1);
-        uint256 depSpot = RebalanceMath.toToken1(received0, sqrtSpot) + received1;
-        uint256 depTwap = RebalanceMath.toToken1(received0, sqrtTwap) + received1;
-
-        uint256 supply = totalSupply();
-        if (supply == 0) {
-            shares = (depSpot < depTwap ? depSpot : depTwap) * INITIAL_SHARES_PER_UNIT;
-            if (shares <= DEAD_SHARES) revert DepositTooSmall();
-            _mint(DEAD, DEAD_SHARES);
-            shares -= DEAD_SHARES;
-        } else {
-            if (valueSpot == 0 || valueTwap == 0) revert DepositTooSmall();
-            uint256 atSpot = FullMath.mulDiv(depSpot, supply, valueSpot);
-            uint256 atTwap = FullMath.mulDiv(depTwap, supply, valueTwap);
-            shares = atSpot < atTwap ? atSpot : atTwap;
-        }
+        shares = _sharesFor(received0, received1, prices, values);
         if (shares == 0 || shares < minShares) revert InsufficientShares(shares, minShares);
 
+        lockedUntil[msg.sender] = block.timestamp + params.depositLock;
         _mint(msg.sender, shares);
         emit Deposited(msg.sender, received0, received1, shares);
     }
 
     /// @notice Burns `shares` and sends the caller its pro-rata part of idle funds, fees and the position.
-    ///         Works while paused. No swap, so the share math cannot be manipulated via the pool price;
-    ///         `min0`/`min1` protect the caller's token mix against sandwiching.
+    ///         Works while paused; only the caller's own post-deposit lock (<= MAX_DEPOSIT_LOCK) applies.
+    ///         No swap, so the share math cannot be manipulated via the pool price; `min0`/`min1` protect
+    ///         the caller's token mix against sandwiching.
     function withdraw(uint256 shares, uint256 min0, uint256 min1, uint256 deadline)
         external
         nonReentrant
@@ -247,9 +256,12 @@ contract AutoBaseVault is
         uint128 burnLiquidity = SafeCast.toUint128(FullMath.mulDiv(_positionLiquidity(), shares, supply));
         if (burnLiquidity != 0) {
             (uint256 burned0, uint256 burned1) = pool.burn(tickLower, tickUpper, burnLiquidity);
-            pool.collect(address(this), tickLower, tickUpper, SafeCast.toUint128(burned0), SafeCast.toUint128(burned1));
-            amount0 += burned0;
-            amount1 += burned1;
+            // Pay out what was actually collected, never what we expected to collect.
+            (uint128 c0, uint128 c1) = pool.collect(
+                address(this), tickLower, tickUpper, SafeCast.toUint128(burned0), SafeCast.toUint128(burned1)
+            );
+            amount0 += c0;
+            amount1 += c1;
         }
         if (amount0 < min0 || amount1 < min1) revert InsufficientOutput(amount0, amount1);
 
@@ -356,9 +368,48 @@ contract AutoBaseVault is
                 // Swap price limit (TWAP +/- slippage) must stay beyond any allowed spot price.
                 || int256(p.maxTwapDeviationTicks) >= int256(uint256(p.maxSlippageBps))
                 || p.minRebalanceInterval < MIN_REBALANCE_INTERVAL || p.minRebalanceInterval > MAX_REBALANCE_INTERVAL
+                || p.depositLock < MIN_DEPOSIT_LOCK || p.depositLock > MAX_DEPOSIT_LOCK
+                || p.minDepositValue < MIN_DEPOSIT_VALUE_FLOOR
         ) revert InvalidParams();
         params = p;
         emit ParamsSet(p);
+    }
+
+    /// @dev Shares for a deposit of (`received0`, `received1`) given the vault values before it, under each
+    ///      price view; the lowest result wins (rounded down). Mints DEAD_SHARES on the very first deposit.
+    function _sharesFor(uint256 received0, uint256 received1, uint160[3] memory prices, uint256[3] memory values)
+        internal
+        returns (uint256 shares)
+    {
+        uint256 supply = totalSupply();
+        uint256 depValue = type(uint256).max;
+        shares = type(uint256).max;
+        for (uint256 i; i < 3; ++i) {
+            uint256 dep = RebalanceMath.toToken1(received0, prices[i]) + received1;
+            if (dep < depValue) depValue = dep;
+            if (supply != 0) {
+                if (values[i] == 0) revert DepositTooSmall();
+                uint256 s = FullMath.mulDiv(dep, supply, values[i]);
+                if (s < shares) shares = s;
+            }
+        }
+        if (depValue < params.minDepositValue) revert DepositTooSmall();
+
+        if (supply == 0) {
+            shares = depValue * INITIAL_SHARES_PER_UNIT;
+            if (shares <= DEAD_SHARES) revert DepositTooSmall();
+            _mint(DEAD, DEAD_SHARES);
+            shares -= DEAD_SHARES;
+        }
+    }
+
+    /// @dev Enforces the post-deposit lock on withdraw (burn) and transfer. Mint is never blocked.
+    function _update(address from, address to, uint256 value) internal override {
+        if (from != address(0)) {
+            uint256 until = lockedUntil[from];
+            if (block.timestamp < until) revert SharesLocked(until);
+        }
+        super._update(from, to, value);
     }
 
     function _checkCallback() internal view {
@@ -370,14 +421,16 @@ contract AutoBaseVault is
         if (deviation > maxDeviation) revert TwapDeviation(spotTick, twapTick);
     }
 
-    /// @dev Spot and TWAP sqrt prices, reverting if they diverge more than allowed.
-    function _checkedPrices() internal view returns (uint160 sqrtSpot, uint160 sqrtTwap) {
+    /// @dev Price views [spot, TWAP tick, TWAP tick + 1] as sqrt prices; reverts if spot and TWAP diverge
+    ///      more than allowed.
+    function _checkedPrices() internal view returns (uint160[3] memory prices) {
         Params memory cfg = params;
-        int24 spotTick;
-        (sqrtSpot, spotTick,,,,,) = pool.slot0();
+        (uint160 sqrtSpot, int24 spotTick,,,,,) = pool.slot0();
         int24 twapTick = _twapTick(cfg.twapWindow);
         _checkDeviation(spotTick, twapTick, cfg.maxTwapDeviationTicks);
-        sqrtTwap = TickMath.getSqrtRatioAtTick(twapTick);
+        prices[0] = sqrtSpot;
+        prices[1] = TickMath.getSqrtRatioAtTick(twapTick);
+        prices[2] = TickMath.getSqrtRatioAtTick(twapTick < TickMath.MAX_TICK ? twapTick + 1 : twapTick);
     }
 
     function _twapTick(uint32 window) internal view returns (int24 tick) {

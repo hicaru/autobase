@@ -17,6 +17,7 @@ contract Deploy is Script {
         address tokenA = vm.envAddress("TOKEN_A");
         address tokenB = vm.envAddress("TOKEN_B");
         uint24 fee = uint24(vm.envUint("POOL_FEE"));
+        uint128 minDepositValue = uint128(vm.envUint("MIN_DEPOSIT_VALUE"));
         require(keeper != msg.sender, "keeper == owner");
 
         AutoBaseVault.Params memory params = AutoBaseVault.Params({
@@ -24,7 +25,9 @@ contract Deploy is Script {
             twapWindow: 600,
             maxTwapDeviationTicks: 100,
             maxSlippageBps: 150,
-            minRebalanceInterval: 1 hours
+            minRebalanceInterval: 1 hours,
+            depositLock: 1 hours,
+            minDepositValue: minDepositValue
         });
 
         vm.startBroadcast();
