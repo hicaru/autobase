@@ -19,7 +19,7 @@ forge build
 forge test                               # fork suite runs only with ETH_RPC_URL (archive node)
 cp .env.example .env                     # KEEPER, TOKEN_A, TOKEN_B, POOL_FEE, MIN_DEPOSIT_VALUE
 forge script script/Deploy.s.sol --rpc-url https://eth.bearby.ru --sender <deployer>             # dry-run
-forge script script/Deploy.s.sol --rpc-url https://eth.bearby.ru --sender <deployer> --browser --broadcast
+forge script script/Deploy.s.sol --rpc-url https://eth.bearby.ru --browser --broadcast
 ```
 
 In the browser wallet, set the network RPC to `https://eth.bearby.ru` (otherwise it sends via its default RPC).
