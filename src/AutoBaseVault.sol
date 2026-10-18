@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
@@ -20,10 +21,14 @@ import {OracleLibrary} from "@uniswap/v3-periphery/contracts/libraries/OracleLib
 import {RebalanceMath} from "./libraries/RebalanceMath.sol";
 
 /// @title AutoBaseVault
-/// @notice Single-owner vault holding one Uniswap v3 concentrated-liquidity position. A keeper bot calls
-///         `rebalance()` to re-center the range around the current price. The keeper can never move funds
-///         out of the vault, change parameters, or trade at a price far from the pool TWAP.
+/// @notice Public Uniswap v3 LP vault for a single pool. Users deposit token0 and/or token1 and receive ERC20
+///         shares; deposits sit idle until the keeper bot calls `rebalance()`, which re-centers the range
+///         around the current price and deploys all idle funds. Withdrawals are pro-rata in both tokens and
+///         are never blocked by pause.
+/// @dev Roles: owner (deployer) sets keeper/params and can pause; keeper can only call `rebalance()`;
+///      nobody but a share holder can move funds out of the vault.
 contract AutoBaseVault is
+    ERC20,
     Ownable2Step,
     Pausable,
     ReentrancyGuardTransient,
@@ -37,11 +42,11 @@ contract AutoBaseVault is
         int24 halfWidthTicks;
         /// @dev TWAP window in seconds used as the reference price.
         uint32 twapWindow;
-        /// @dev Max allowed |spot tick - TWAP tick| to rebalance at all.
+        /// @dev Max allowed |spot tick - TWAP tick| for rebalance and deposit.
         int24 maxTwapDeviationTicks;
         /// @dev Max loss vs. TWAP quote on the rebalance swap, pool fee included.
         uint16 maxSlippageBps;
-        /// @dev Cooldown between rebalances.
+        /// @dev Cooldown between range moves.
         uint32 minRebalanceInterval;
     }
 
@@ -54,15 +59,21 @@ contract AutoBaseVault is
     uint16 public constant MAX_SLIPPAGE_BPS = 500;
     uint32 public constant MIN_REBALANCE_INTERVAL = 1 minutes;
     uint32 public constant MAX_REBALANCE_INTERVAL = 7 days;
+    /// @dev Shares minted per unit of first-deposit value (value is in token1 base units).
+    uint256 public constant INITIAL_SHARES_PER_UNIT = 1e6;
+    /// @dev Shares burned to a dead address on first deposit (inflation-attack mitigation).
+    uint256 public constant DEAD_SHARES = 1e9;
+    address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
     /// @dev Wei kept back from each balance when sizing liquidity: pool.mint rounds owed amounts up.
     uint256 internal constant MINT_DUST = 2;
+    /// @dev Rebalance swaps whose TWAP-quoted output is below this many base units are skipped: integer
+    ///      rounding on dust would trip the slippage check. Assumes both tokens have >= 6 decimals.
+    uint256 internal constant MIN_SWAP_OUT = 1_000;
 
-    IUniswapV3Factory public immutable factory;
-
-    IUniswapV3Pool public pool;
-    IERC20 public token0;
-    IERC20 public token1;
-    int24 public tickSpacing;
+    IUniswapV3Pool public immutable pool;
+    IERC20 public immutable token0;
+    IERC20 public immutable token1;
+    int24 public immutable tickSpacing;
 
     address public keeper;
     Params public params;
@@ -74,21 +85,26 @@ contract AutoBaseVault is
     /// @dev Set only while this contract is inside a pool.mint / pool.swap call it initiated.
     bool private transient _expectingCallback;
 
-    event PoolSet(address indexed pool, address token0, address token1, uint24 fee, int24 tickSpacing);
     event KeeperSet(address indexed keeper);
     event ParamsSet(Params params);
+    event Deposited(address indexed user, uint256 amount0, uint256 amount1, uint256 shares);
+    event Withdrawn(address indexed user, uint256 shares, uint256 amount0, uint256 amount1);
     event Rebalanced(
-        int24 oldLower, int24 oldUpper, int24 newLower, int24 newUpper, uint128 liquidity, uint256 fees0, uint256 fees1
+        int24 oldLower,
+        int24 oldUpper,
+        int24 newLower,
+        int24 newUpper,
+        uint128 liquidityAdded,
+        uint256 fees0,
+        uint256 fees1
     );
     event Swapped(bool zeroForOne, uint256 amountIn, uint256 amountOut);
     event PositionExited(int24 tickLower, int24 tickUpper, uint256 amount0, uint256 amount1);
-    event Withdrawn(address indexed token, uint256 amount);
 
     error ZeroAddress();
+    error ZeroAmount();
     error NotKeeper();
-    error PoolNotSet();
     error PoolNotFound();
-    error PositionOpen();
     error InvalidParams();
     error Expired();
     error Cooldown();
@@ -96,6 +112,9 @@ contract AutoBaseVault is
     error NothingToDo();
     error SlippageExceeded(uint256 amountOut, uint256 minAmountOut);
     error InsufficientLiquidity(uint128 liquidity, uint128 minLiquidity);
+    error InsufficientShares(uint256 shares, uint256 minShares);
+    error InsufficientOutput(uint256 amount0, uint256 amount1);
+    error DepositTooSmall();
     error UnauthorizedCallback();
 
     modifier onlyKeeper() {
@@ -103,9 +122,28 @@ contract AutoBaseVault is
         _;
     }
 
-    constructor(address owner_, address keeper_, IUniswapV3Factory factory_, Params memory params_) Ownable(owner_) {
-        if (keeper_ == address(0) || address(factory_) == address(0)) revert ZeroAddress();
-        factory = factory_;
+    modifier checkDeadline(uint256 deadline) {
+        if (block.timestamp > deadline) revert Expired();
+        _;
+    }
+
+    /// @notice The deployer becomes the owner. The pool is fixed for the lifetime of the vault.
+    constructor(
+        address keeper_,
+        IUniswapV3Factory factory,
+        address tokenA,
+        address tokenB,
+        uint24 fee,
+        Params memory params_
+    ) ERC20("AutoBase LP", "ABLP") Ownable(msg.sender) {
+        if (keeper_ == address(0) || address(factory) == address(0)) revert ZeroAddress();
+        address p = factory.getPool(tokenA, tokenB, fee);
+        if (p == address(0)) revert PoolNotFound();
+
+        pool = IUniswapV3Pool(p);
+        token0 = IERC20(IUniswapV3Pool(p).token0());
+        token1 = IERC20(IUniswapV3Pool(p).token1());
+        tickSpacing = IUniswapV3Pool(p).tickSpacing();
         _setKeeper(keeper_);
         _setParams(params_);
     }
@@ -113,22 +151,6 @@ contract AutoBaseVault is
     // ------------------------------------------------------------------
     // Owner
     // ------------------------------------------------------------------
-
-    /// @notice Selects the pool by (tokenA, tokenB, fee) via the canonical factory. Only while no position is open.
-    function setPool(address tokenA, address tokenB, uint24 fee) external onlyOwner {
-        if (_positionLiquidity() != 0) revert PositionOpen();
-        address p = factory.getPool(tokenA, tokenB, fee);
-        if (p == address(0)) revert PoolNotFound();
-
-        IUniswapV3Pool newPool = IUniswapV3Pool(p);
-        pool = newPool;
-        token0 = IERC20(newPool.token0());
-        token1 = IERC20(newPool.token1());
-        tickSpacing = newPool.tickSpacing();
-        tickLower = 0;
-        tickUpper = 0;
-        emit PoolSet(p, address(token0), address(token1), fee, tickSpacing);
-    }
 
     function setKeeper(address keeper_) external onlyOwner {
         _setKeeper(keeper_);
@@ -138,6 +160,7 @@ contract AutoBaseVault is
         _setParams(params_);
     }
 
+    /// @notice Stops deposits and rebalances. Withdrawals keep working.
     function pause() external onlyOwner {
         _pause();
     }
@@ -146,63 +169,142 @@ contract AutoBaseVault is
         _unpause();
     }
 
-    /// @notice Burns the whole position and collects everything into the vault.
+    /// @notice Emergency: burns the whole position into idle balances inside the vault (funds never leave).
     function exitPosition() external onlyOwner nonReentrant {
         int24 lower = tickLower;
         int24 upper = tickUpper;
-        (uint256 amount0, uint256 amount1,,) = _burnAndCollect();
+        if (_positionLiquidity() == 0) revert NothingToDo();
+        (uint256 amount0, uint256 amount1,,) = _burnAndCollect(lower, upper);
         tickLower = 0;
         tickUpper = 0;
         emit PositionExited(lower, upper, amount0, amount1);
     }
 
-    /// @notice Sends `amount` of `token` to the owner. Funds can only ever leave to the owner.
-    function withdraw(IERC20 token, uint256 amount) external onlyOwner nonReentrant {
-        token.safeTransfer(owner(), amount);
-        emit Withdrawn(address(token), amount);
+    // ------------------------------------------------------------------
+    // Users
+    // ------------------------------------------------------------------
+
+    /// @notice Deposits token0 and/or token1 (requires prior `approve`) and mints shares to the caller.
+    ///         Funds stay idle until the next `rebalance()`.
+    /// @dev Shares are priced at both spot and TWAP and the depositor gets the lower amount, so moving the
+    ///      pool price can only hurt the depositor, never existing holders.
+    function deposit(uint256 amount0, uint256 amount1, uint256 minShares, uint256 deadline)
+        external
+        whenNotPaused
+        nonReentrant
+        checkDeadline(deadline)
+        returns (uint256 shares)
+    {
+        if (amount0 == 0 && amount1 == 0) revert ZeroAmount();
+        (uint160 sqrtSpot, uint160 sqrtTwap) = _checkedPrices();
+        _collectFees();
+
+        // Vault holdings before the deposit, valued at both prices.
+        uint128 liquidity = _positionLiquidity();
+        uint256 valueSpot = _totalValue(sqrtSpot, liquidity);
+        uint256 valueTwap = _totalValue(sqrtTwap, liquidity);
+
+        uint256 received0 = _pull(token0, amount0);
+        uint256 received1 = _pull(token1, amount1);
+        uint256 depSpot = RebalanceMath.toToken1(received0, sqrtSpot) + received1;
+        uint256 depTwap = RebalanceMath.toToken1(received0, sqrtTwap) + received1;
+
+        uint256 supply = totalSupply();
+        if (supply == 0) {
+            shares = (depSpot < depTwap ? depSpot : depTwap) * INITIAL_SHARES_PER_UNIT;
+            if (shares <= DEAD_SHARES) revert DepositTooSmall();
+            _mint(DEAD, DEAD_SHARES);
+            shares -= DEAD_SHARES;
+        } else {
+            if (valueSpot == 0 || valueTwap == 0) revert DepositTooSmall();
+            uint256 atSpot = FullMath.mulDiv(depSpot, supply, valueSpot);
+            uint256 atTwap = FullMath.mulDiv(depTwap, supply, valueTwap);
+            shares = atSpot < atTwap ? atSpot : atTwap;
+        }
+        if (shares == 0 || shares < minShares) revert InsufficientShares(shares, minShares);
+
+        _mint(msg.sender, shares);
+        emit Deposited(msg.sender, received0, received1, shares);
+    }
+
+    /// @notice Burns `shares` and sends the caller its pro-rata part of idle funds, fees and the position.
+    ///         Works while paused. No swap, so the share math cannot be manipulated via the pool price;
+    ///         `min0`/`min1` protect the caller's token mix against sandwiching.
+    function withdraw(uint256 shares, uint256 min0, uint256 min1, uint256 deadline)
+        external
+        nonReentrant
+        checkDeadline(deadline)
+        returns (uint256 amount0, uint256 amount1)
+    {
+        if (shares == 0) revert ZeroAmount();
+        uint256 supply = totalSupply();
+        _burn(msg.sender, shares);
+
+        _collectFees();
+        amount0 = FullMath.mulDiv(token0.balanceOf(address(this)), shares, supply);
+        amount1 = FullMath.mulDiv(token1.balanceOf(address(this)), shares, supply);
+
+        uint128 burnLiquidity = SafeCast.toUint128(FullMath.mulDiv(_positionLiquidity(), shares, supply));
+        if (burnLiquidity != 0) {
+            (uint256 burned0, uint256 burned1) = pool.burn(tickLower, tickUpper, burnLiquidity);
+            pool.collect(address(this), tickLower, tickUpper, SafeCast.toUint128(burned0), SafeCast.toUint128(burned1));
+            amount0 += burned0;
+            amount1 += burned1;
+        }
+        if (amount0 < min0 || amount1 < min1) revert InsufficientOutput(amount0, amount1);
+
+        if (amount0 != 0) token0.safeTransfer(msg.sender, amount0);
+        if (amount1 != 0) token1.safeTransfer(msg.sender, amount1);
+        emit Withdrawn(msg.sender, shares, amount0, amount1);
     }
 
     // ------------------------------------------------------------------
     // Keeper
     // ------------------------------------------------------------------
 
-    /// @notice Re-centers the position around the current price.
-    /// @param minLiquidity Keeper-side floor on the minted liquidity.
+    /// @notice Re-centers the position around the current price if the range changed (subject to cooldown),
+    ///         otherwise compounds fees and idle deposits into the current range.
+    /// @param minLiquidity Keeper-side floor on the liquidity added by this call.
     /// @param deadline Transaction is rejected after this timestamp.
-    function rebalance(uint128 minLiquidity, uint256 deadline) external onlyKeeper whenNotPaused nonReentrant {
-        if (block.timestamp > deadline) revert Expired();
-        IUniswapV3Pool p = pool;
-        if (address(p) == address(0)) revert PoolNotSet();
+    function rebalance(uint128 minLiquidity, uint256 deadline)
+        external
+        onlyKeeper
+        whenNotPaused
+        nonReentrant
+        checkDeadline(deadline)
+    {
         Params memory cfg = params;
-        if (lastRebalance != 0 && block.timestamp < lastRebalance + cfg.minRebalanceInterval) revert Cooldown();
-
-        (, int24 spotTick,,,,,) = p.slot0();
-        int24 twapTick = _twapTick(p, cfg.twapWindow);
-        int24 deviation = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
-        if (deviation > cfg.maxTwapDeviationTicks) revert TwapDeviation(spotTick, twapTick);
+        (, int24 spotTick,,,,,) = pool.slot0();
+        int24 twapTick = _twapTick(cfg.twapWindow);
+        _checkDeviation(spotTick, twapTick, cfg.maxTwapDeviationTicks);
 
         (int24 newLower, int24 newUpper) = RebalanceMath.rangeAround(spotTick, cfg.halfWidthTicks, tickSpacing);
         int24 oldLower = tickLower;
         int24 oldUpper = tickUpper;
-        bool hasPosition = _positionLiquidity() != 0;
-        if (hasPosition && newLower == oldLower && newUpper == oldUpper) revert NothingToDo();
-
-        // Effects before interactions with the pool.
-        lastRebalance = block.timestamp;
-        tickLower = newLower;
-        tickUpper = newUpper;
+        uint128 liquidity = _positionLiquidity();
+        bool moveRange = liquidity == 0 || newLower != oldLower || newUpper != oldUpper;
 
         uint256 fees0;
         uint256 fees1;
-        if (hasPosition) {
-            (,, fees0, fees1) = _burnAndCollect(oldLower, oldUpper);
+        if (moveRange) {
+            if (lastRebalance != 0 && block.timestamp < lastRebalance + cfg.minRebalanceInterval) revert Cooldown();
+            // Effects before interactions with the pool.
+            lastRebalance = block.timestamp;
+            tickLower = newLower;
+            tickUpper = newUpper;
+            if (liquidity != 0) (,, fees0, fees1) = _burnAndCollect(oldLower, oldUpper);
+        } else {
+            newLower = oldLower;
+            newUpper = oldUpper;
+            (fees0, fees1) = _collectFees();
         }
 
-        _swapToRatio(p, twapTick, cfg.maxSlippageBps, newLower, newUpper);
-        uint128 liquidity = _mint(p, newLower, newUpper);
-        if (liquidity == 0 || liquidity < minLiquidity) revert InsufficientLiquidity(liquidity, minLiquidity);
+        _swapToRatio(twapTick, cfg.maxSlippageBps, newLower, newUpper);
+        uint128 added = _mint(newLower, newUpper);
+        if (added == 0 && !moveRange) revert NothingToDo();
+        if (added == 0 || added < minLiquidity) revert InsufficientLiquidity(added, minLiquidity);
 
-        emit Rebalanced(oldLower, oldUpper, newLower, newUpper, liquidity, fees0, fees1);
+        emit Rebalanced(oldLower, oldUpper, newLower, newUpper, added, fees0, fees1);
     }
 
     // ------------------------------------------------------------------
@@ -222,11 +324,17 @@ contract AutoBaseVault is
     }
 
     // ------------------------------------------------------------------
-    // Views
+    // Views (informational only — spot-based, never use as an oracle)
     // ------------------------------------------------------------------
 
     function positionLiquidity() external view returns (uint128) {
         return _positionLiquidity();
+    }
+
+    /// @notice Idle + position amounts at the current spot price, excluding uncollected fees.
+    function totalAmounts() external view returns (uint256 total0, uint256 total1) {
+        (uint160 sqrtSpot,,,,,,) = pool.slot0();
+        return _totalAmounts(sqrtSpot, _positionLiquidity());
     }
 
     // ------------------------------------------------------------------
@@ -257,19 +365,60 @@ contract AutoBaseVault is
         if (!_expectingCallback || msg.sender != address(pool)) revert UnauthorizedCallback();
     }
 
+    function _checkDeviation(int24 spotTick, int24 twapTick, int24 maxDeviation) internal pure {
+        int24 deviation = spotTick > twapTick ? spotTick - twapTick : twapTick - spotTick;
+        if (deviation > maxDeviation) revert TwapDeviation(spotTick, twapTick);
+    }
+
+    /// @dev Spot and TWAP sqrt prices, reverting if they diverge more than allowed.
+    function _checkedPrices() internal view returns (uint160 sqrtSpot, uint160 sqrtTwap) {
+        Params memory cfg = params;
+        int24 spotTick;
+        (sqrtSpot, spotTick,,,,,) = pool.slot0();
+        int24 twapTick = _twapTick(cfg.twapWindow);
+        _checkDeviation(spotTick, twapTick, cfg.maxTwapDeviationTicks);
+        sqrtTwap = TickMath.getSqrtRatioAtTick(twapTick);
+    }
+
+    function _twapTick(uint32 window) internal view returns (int24 tick) {
+        (tick,) = OracleLibrary.consult(address(pool), window);
+    }
+
     function _positionLiquidity() internal view returns (uint128 liquidity) {
-        IUniswapV3Pool p = pool;
-        if (address(p) == address(0)) return 0;
-        (liquidity,,,,) = p.positions(keccak256(abi.encodePacked(address(this), tickLower, tickUpper)));
+        (liquidity,,,,) = pool.positions(keccak256(abi.encodePacked(address(this), tickLower, tickUpper)));
     }
 
-    function _twapTick(IUniswapV3Pool p, uint32 window) internal view returns (int24 tick) {
-        (tick,) = OracleLibrary.consult(address(p), window);
+    function _totalAmounts(uint160 sqrtP, uint128 liquidity) internal view returns (uint256 total0, uint256 total1) {
+        if (liquidity != 0) {
+            (total0, total1) = LiquidityAmounts.getAmountsForLiquidity(
+                sqrtP, TickMath.getSqrtRatioAtTick(tickLower), TickMath.getSqrtRatioAtTick(tickUpper), liquidity
+            );
+        }
+        total0 += token0.balanceOf(address(this));
+        total1 += token1.balanceOf(address(this));
     }
 
-    function _burnAndCollect() internal returns (uint256, uint256, uint256, uint256) {
-        if (_positionLiquidity() == 0) revert NothingToDo();
-        return _burnAndCollect(tickLower, tickUpper);
+    /// @dev Total vault value in token1 units at `sqrtP`.
+    function _totalValue(uint160 sqrtP, uint128 liquidity) internal view returns (uint256) {
+        (uint256 total0, uint256 total1) = _totalAmounts(sqrtP, liquidity);
+        return RebalanceMath.toToken1(total0, sqrtP) + total1;
+    }
+
+    /// @dev Pulls `amount` from the caller and returns what actually arrived.
+    function _pull(IERC20 token, uint256 amount) internal returns (uint256) {
+        if (amount == 0) return 0;
+        uint256 before = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        return token.balanceOf(address(this)) - before;
+    }
+
+    /// @dev Moves accrued fees of the current position into idle balances.
+    function _collectFees() internal returns (uint256 fees0, uint256 fees1) {
+        if (_positionLiquidity() == 0) return (0, 0);
+        pool.burn(tickLower, tickUpper, 0);
+        (uint128 c0, uint128 c1) =
+            pool.collect(address(this), tickLower, tickUpper, type(uint128).max, type(uint128).max);
+        return (c0, c1);
     }
 
     /// @return collected0 Total token0 received (principal + fees).
@@ -280,18 +429,17 @@ contract AutoBaseVault is
         internal
         returns (uint256 collected0, uint256 collected1, uint256 fees0, uint256 fees1)
     {
-        IUniswapV3Pool p = pool;
-        (uint128 liquidity,,,,) = p.positions(keccak256(abi.encodePacked(address(this), lower, upper)));
-        (uint256 burned0, uint256 burned1) = p.burn(lower, upper, liquidity);
-        (uint128 c0, uint128 c1) = p.collect(address(this), lower, upper, type(uint128).max, type(uint128).max);
+        (uint128 liquidity,,,,) = pool.positions(keccak256(abi.encodePacked(address(this), lower, upper)));
+        (uint256 burned0, uint256 burned1) = pool.burn(lower, upper, liquidity);
+        (uint128 c0, uint128 c1) = pool.collect(address(this), lower, upper, type(uint128).max, type(uint128).max);
         collected0 = c0;
         collected1 = c1;
         fees0 = collected0 - burned0;
         fees1 = collected1 - burned1;
     }
 
-    function _swapToRatio(IUniswapV3Pool p, int24 twapTick, uint16 slippageBps, int24 lower, int24 upper) internal {
-        (uint160 sqrtP,,,,,,) = p.slot0();
+    function _swapToRatio(int24 twapTick, uint16 slippageBps, int24 lower, int24 upper) internal {
+        (uint160 sqrtP,,,,,,) = pool.slot0();
         (bool zeroForOne, uint256 amountIn) = RebalanceMath.computeSwap(
             token0.balanceOf(address(this)),
             token1.balanceOf(address(this)),
@@ -299,39 +447,41 @@ contract AutoBaseVault is
             TickMath.getSqrtRatioAtTick(lower),
             TickMath.getSqrtRatioAtTick(upper)
         );
-        if (amountIn == 0) return;
-        _swapGuarded(p, zeroForOne, amountIn, twapTick, slippageBps);
+        if (amountIn == 0 || _quoteAtTwap(zeroForOne, amountIn, twapTick) < MIN_SWAP_OUT) return;
+        _swapGuarded(zeroForOne, amountIn, twapTick, slippageBps);
     }
 
     /// @dev Swaps `amountIn` with a hard price limit and a min-out both derived from the TWAP, never from spot.
-    function _swapGuarded(IUniswapV3Pool p, bool zeroForOne, uint256 amountIn, int24 twapTick, uint16 slippageBps)
-        internal
-    {
+    function _swapGuarded(bool zeroForOne, uint256 amountIn, int24 twapTick, uint16 slippageBps) internal {
         // ~1 tick per bp.
         int24 limitTick = zeroForOne ? twapTick - int24(uint24(slippageBps)) : twapTick + int24(uint24(slippageBps));
         if (limitTick <= TickMath.MIN_TICK) limitTick = TickMath.MIN_TICK + 1;
         if (limitTick >= TickMath.MAX_TICK) limitTick = TickMath.MAX_TICK - 1;
 
         _expectingCallback = true;
-        (int256 d0, int256 d1) =
-            p.swap(address(this), zeroForOne, SafeCast.toInt256(amountIn), TickMath.getSqrtRatioAtTick(limitTick), "");
+        (int256 d0, int256 d1) = pool.swap(
+            address(this), zeroForOne, SafeCast.toInt256(amountIn), TickMath.getSqrtRatioAtTick(limitTick), ""
+        );
         _expectingCallback = false;
 
         // The limit may cause a partial fill; check what was actually paid vs. what was received.
         (uint256 paid, uint256 received) = zeroForOne
             ? (SafeCast.toUint256(d0), SafeCast.toUint256(-d1))
             : (SafeCast.toUint256(d1), SafeCast.toUint256(-d0));
-        uint256 quote = zeroForOne
-            ? OracleLibrary.getQuoteAtTick(twapTick, SafeCast.toUint128(paid), address(token0), address(token1))
-            : OracleLibrary.getQuoteAtTick(twapTick, SafeCast.toUint128(paid), address(token1), address(token0));
-        uint256 minOut = FullMath.mulDiv(quote, BPS - slippageBps, BPS);
+        uint256 minOut = FullMath.mulDiv(_quoteAtTwap(zeroForOne, paid, twapTick), BPS - slippageBps, BPS);
         if (received < minOut) revert SlippageExceeded(received, minOut);
 
         emit Swapped(zeroForOne, paid, received);
     }
 
-    function _mint(IUniswapV3Pool p, int24 lower, int24 upper) internal returns (uint128 liquidity) {
-        (uint160 sqrtP,,,,,,) = p.slot0();
+    function _quoteAtTwap(bool zeroForOne, uint256 amountIn, int24 twapTick) internal view returns (uint256) {
+        return zeroForOne
+            ? OracleLibrary.getQuoteAtTick(twapTick, SafeCast.toUint128(amountIn), address(token0), address(token1))
+            : OracleLibrary.getQuoteAtTick(twapTick, SafeCast.toUint128(amountIn), address(token1), address(token0));
+    }
+
+    function _mint(int24 lower, int24 upper) internal returns (uint128 liquidity) {
+        (uint160 sqrtP,,,,,,) = pool.slot0();
         uint256 bal0 = token0.balanceOf(address(this));
         uint256 bal1 = token1.balanceOf(address(this));
         liquidity = LiquidityAmounts.getLiquidityForAmounts(
@@ -344,7 +494,7 @@ contract AutoBaseVault is
         if (liquidity == 0) return 0;
 
         _expectingCallback = true;
-        p.mint(address(this), lower, upper, liquidity, "");
+        pool.mint(address(this), lower, upper, liquidity, "");
         _expectingCallback = false;
     }
 }

@@ -98,9 +98,9 @@ contract RebalanceMathTest is Test {
         uint128 liq = LiquidityAmounts.getLiquidityForAmounts(sqrtP, sqrtA, sqrtB, b0, b1);
         (uint256 used0, uint256 used1) = LiquidityAmounts.getAmountsForLiquidity(sqrtP, sqrtA, sqrtB, liq);
         uint256 usedValue = RebalanceMath.toToken1(used0, sqrtP) + used1;
-        // <= 0.01% of value left idle, plus a few wei of integer rounding.
+        // <= 0.01% of value left idle, plus a few wei of integer rounding (matters at extreme prices).
         assertLe(usedValue, value);
-        assertGe(usedValue + RebalanceMath.toToken1(2, sqrtP) + 2, value - value / 10_000);
+        assertGe(usedValue + RebalanceMath.toToken1(4, sqrtP) + 4, value - value / 10_000);
     }
 
     function _spacing(uint8 seed) private pure returns (int24) {

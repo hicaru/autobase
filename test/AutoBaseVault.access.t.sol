@@ -2,35 +2,40 @@
 pragma solidity 0.8.28;
 
 import {Test} from "forge-std/Test.sol";
-import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
 import {IUniswapV3Factory} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Factory.sol";
 
 import {AutoBaseVault} from "../src/AutoBaseVault.sol";
 
-contract MockToken is ERC20 {
-    constructor() ERC20("Mock", "MCK") {
-        _mint(msg.sender, 1e24);
-    }
+/// @dev Just enough pool surface for the constructor.
+contract MockPool {
+    address public token0 = address(0xA);
+    address public token1 = address(0xB);
+    int24 public tickSpacing = 60;
 }
 
-/// @dev Factory that knows no pools.
-contract EmptyFactory {
-    function getPool(address, address, uint24) external pure returns (address) {
-        return address(0);
+contract MockFactory {
+    address public pool;
+
+    constructor(address pool_) {
+        pool = pool_;
+    }
+
+    function getPool(address, address, uint24) external view returns (address) {
+        return pool;
     }
 }
 
 contract AutoBaseVaultAccessTest is Test {
     AutoBaseVault internal vault;
-    address internal owner = makeAddr("owner");
+    IUniswapV3Factory internal factory;
     address internal keeper = makeAddr("keeper");
     address internal attacker = makeAddr("attacker");
 
     function setUp() public {
-        vault = new AutoBaseVault(owner, keeper, IUniswapV3Factory(address(new EmptyFactory())), defaultParams());
+        factory = IUniswapV3Factory(address(new MockFactory(address(new MockPool()))));
+        vault = new AutoBaseVault(keeper, factory, address(0xA), address(0xB), 3000, defaultParams());
     }
 
     function defaultParams() internal pure returns (AutoBaseVault.Params memory) {
@@ -45,16 +50,30 @@ contract AutoBaseVaultAccessTest is Test {
 
     // ---------------- constructor ----------------
 
-    function test_constructor_revertsOnZeroKeeper() public {
-        IUniswapV3Factory f = IUniswapV3Factory(address(new EmptyFactory()));
-        vm.expectRevert(AutoBaseVault.ZeroAddress.selector);
-        new AutoBaseVault(owner, address(0), f, defaultParams());
+    function test_constructor_deployerIsOwnerAndPoolFixed() public view {
+        assertEq(vault.owner(), address(this));
+        assertEq(vault.keeper(), keeper);
+        assertEq(address(vault.token0()), address(0xA));
+        assertEq(address(vault.token1()), address(0xB));
+        assertEq(vault.tickSpacing(), 60);
     }
 
-    function test_constructor_revertsOnZeroOwner() public {
-        IUniswapV3Factory f = IUniswapV3Factory(address(new EmptyFactory()));
-        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableInvalidOwner.selector, address(0)));
-        new AutoBaseVault(address(0), keeper, f, defaultParams());
+    function test_constructor_revertsOnZeroKeeper() public {
+        vm.expectRevert(AutoBaseVault.ZeroAddress.selector);
+        new AutoBaseVault(address(0), factory, address(0xA), address(0xB), 3000, defaultParams());
+    }
+
+    function test_constructor_revertsOnUnknownPool() public {
+        IUniswapV3Factory empty = IUniswapV3Factory(address(new MockFactory(address(0))));
+        vm.expectRevert(AutoBaseVault.PoolNotFound.selector);
+        new AutoBaseVault(keeper, empty, address(0xA), address(0xB), 3000, defaultParams());
+    }
+
+    function test_constructor_revertsOnInvalidParams() public {
+        AutoBaseVault.Params memory p = defaultParams();
+        p.maxSlippageBps = 0;
+        vm.expectRevert(AutoBaseVault.InvalidParams.selector);
+        new AutoBaseVault(keeper, factory, address(0xA), address(0xB), 3000, p);
     }
 
     // ---------------- owner-only ----------------
@@ -67,8 +86,6 @@ contract AutoBaseVaultAccessTest is Test {
 
             vm.startPrank(c);
             vm.expectRevert(err);
-            vault.setPool(address(1), address(2), 3000);
-            vm.expectRevert(err);
             vault.setKeeper(c);
             vm.expectRevert(err);
             vault.setParams(defaultParams());
@@ -79,15 +96,14 @@ contract AutoBaseVaultAccessTest is Test {
             vm.expectRevert(err);
             vault.exitPosition();
             vm.expectRevert(err);
-            vault.withdraw(IERC20(address(1)), 1);
+            vault.transferOwnership(c);
             vm.stopPrank();
         }
     }
 
     function test_ownership_isTwoStep() public {
-        vm.prank(owner);
         vault.transferOwnership(attacker);
-        assertEq(vault.owner(), owner);
+        assertEq(vault.owner(), address(this));
         assertEq(vault.pendingOwner(), attacker);
         vm.prank(attacker);
         vault.acceptOwnership();
@@ -96,21 +112,13 @@ contract AutoBaseVaultAccessTest is Test {
 
     function test_setKeeper() public {
         address k = makeAddr("newKeeper");
-        vm.prank(owner);
         vault.setKeeper(k);
         assertEq(vault.keeper(), k);
     }
 
     function test_setKeeper_revertsOnZero() public {
-        vm.prank(owner);
         vm.expectRevert(AutoBaseVault.ZeroAddress.selector);
         vault.setKeeper(address(0));
-    }
-
-    function test_setPool_revertsWhenUnknown() public {
-        vm.prank(owner);
-        vm.expectRevert(AutoBaseVault.PoolNotFound.selector);
-        vault.setPool(address(1), address(2), 3000);
     }
 
     // ---------------- params bounds ----------------
@@ -134,6 +142,9 @@ contract AutoBaseVaultAccessTest is Test {
         p.maxTwapDeviationTicks = 0;
         _expectInvalid(p);
         p = defaultParams();
+        p.maxTwapDeviationTicks = vault.MAX_TWAP_DEVIATION() + 1;
+        _expectInvalid(p);
+        p = defaultParams();
         p.maxSlippageBps = 0;
         _expectInvalid(p);
         p = defaultParams();
@@ -151,15 +162,13 @@ contract AutoBaseVaultAccessTest is Test {
     }
 
     function _expectInvalid(AutoBaseVault.Params memory p) internal {
-        vm.prank(owner);
         vm.expectRevert(AutoBaseVault.InvalidParams.selector);
         vault.setParams(p);
     }
 
-    // ---------------- keeper ----------------
+    // ---------------- keeper / users ----------------
 
     function test_rebalance_revertsForNonKeeper() public {
-        vm.prank(owner);
         vm.expectRevert(AutoBaseVault.NotKeeper.selector);
         vault.rebalance(0, block.timestamp);
         vm.prank(attacker);
@@ -168,24 +177,39 @@ contract AutoBaseVaultAccessTest is Test {
     }
 
     function test_rebalance_revertsWhenPaused() public {
-        vm.prank(owner);
         vault.pause();
         vm.prank(keeper);
         vm.expectRevert(Pausable.EnforcedPause.selector);
         vault.rebalance(0, block.timestamp);
     }
 
-    function test_rebalance_revertsAfterDeadline() public {
+    function test_deposit_revertsWhenPaused() public {
+        vault.pause();
+        vm.prank(attacker);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vault.deposit(1, 1, 0, block.timestamp);
+    }
+
+    function test_deadlines() public {
         vm.warp(1000);
         vm.prank(keeper);
         vm.expectRevert(AutoBaseVault.Expired.selector);
         vault.rebalance(0, 999);
+        vm.startPrank(attacker);
+        vm.expectRevert(AutoBaseVault.Expired.selector);
+        vault.deposit(1, 1, 0, 999);
+        vm.expectRevert(AutoBaseVault.Expired.selector);
+        vault.withdraw(1, 0, 0, 999);
+        vm.stopPrank();
     }
 
-    function test_rebalance_revertsWithoutPool() public {
-        vm.prank(keeper);
-        vm.expectRevert(AutoBaseVault.PoolNotSet.selector);
-        vault.rebalance(0, block.timestamp);
+    function test_zeroAmounts() public {
+        vm.startPrank(attacker);
+        vm.expectRevert(AutoBaseVault.ZeroAmount.selector);
+        vault.deposit(0, 0, 0, block.timestamp);
+        vm.expectRevert(AutoBaseVault.ZeroAmount.selector);
+        vault.withdraw(0, 0, 0, block.timestamp);
+        vm.stopPrank();
     }
 
     // ---------------- callbacks ----------------
@@ -197,17 +221,6 @@ contract AutoBaseVaultAccessTest is Test {
         vm.expectRevert(AutoBaseVault.UnauthorizedCallback.selector);
         vault.uniswapV3SwapCallback(1, 1, "");
         vm.stopPrank();
-    }
-
-    // ---------------- withdraw ----------------
-
-    function test_withdraw_alwaysGoesToOwner() public {
-        MockToken t = new MockToken();
-        assertTrue(t.transfer(address(vault), 100));
-        vm.prank(owner);
-        vault.withdraw(t, 60);
-        assertEq(t.balanceOf(owner), 60);
-        assertEq(t.balanceOf(address(vault)), 40);
     }
 
     function test_vault_rejectsEther() public {

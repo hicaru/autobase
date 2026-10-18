@@ -6,21 +6,30 @@ Rules for any human or AI agent touching this repository. **Security is the only
 
 ## 1. What this project is
 
-`AutoBaseVault` is a **single-owner** vault that holds one Uniswap v3 concentrated-liquidity position on Ethereum mainnet (e.g. WBTC/XAUT 0.3%). An off-chain bot (the **keeper**) calls `rebalance()`, and the vault itself:
+`AutoBaseVault` is a **public, permissionless LP vault** for one fixed Uniswap v3 pool on Ethereum mainnet (e.g. WBTC/XAUT 0.3%). It holds **other people's money**, so every change must be reviewed as if it were holding someone else's savings.
 
-1. checks spot price vs. pool TWAP,
-2. computes a new range centered on the current tick,
-3. burns + collects the old position,
-4. swaps to the target ratio (TWAP-bounded),
-5. mints the new position.
+**Roles**
+
+| Role | Who | Can do | Can never do |
+|------|-----|---------|--------------|
+| **owner** | deployer (`Ownable(msg.sender)`; 2-step transfer) | `setKeeper`, `setParams` (bounded), `pause`/`unpause`, emergency `exitPosition` (funds stay in the vault) | withdraw, move or redirect user funds, change the pool |
+| **keeper** | bot on a VPS | `rebalance(minLiquidity, deadline)` only | anything else |
+| **user** | anyone | `deposit(amount0, amount1, minShares, deadline)` → ERC20 shares (`ABLP`); `withdraw(shares, min0, min1, deadline)` → pro-rata token0 + token1 | affect other users' share value |
+
+**Flow**
+1. A user calls `approve` and then `deposit`. Funds sit **idle**, and the vault emits `Deposited`. A plain ERC20 `transfer` to the vault is a donation to all holders and credits nobody.
+2. The bot sees `Deposited` (or a price move) and calls `rebalance()`:
+   - if the range is unchanged, it compounds fees and idle funds into the current range (no cooldown);
+   - if the range changed (or there is no position yet), it burns, collects, swaps to ratio and mints a new centered range (cooldown `minRebalanceInterval`).
+3. `withdraw` burns shares and pays out the pro-rata part of idle funds, fees and position liquidity in **both tokens** (no swap). It **works while paused**.
 
 ```
-src/AutoBaseVault.sol              vault (roles, rebalance, callbacks)
-src/libraries/RebalanceMath.sol    pure math: tick alignment, range, swap sizing
+src/AutoBaseVault.sol              vault (ERC20 shares, roles, deposit/withdraw, rebalance, callbacks)
+src/libraries/RebalanceMath.sol    pure math: tick alignment, range, swap sizing, token0→token1 value
 test/RebalanceMath.t.sol           unit + fuzz
-test/AutoBaseVault.access.t.sol    roles, params bounds, pause, callback spoofing (no fork)
-test/AutoBaseVault.fork.t.sol      mainnet fork vs the real pool (needs ETH_RPC_URL)
-script/Deploy.s.sol                deploy → setPool → transferOwnership(OWNER)
+test/AutoBaseVault.access.t.sol    roles, params bounds, pause, deadlines, callback spoofing (no fork)
+test/AutoBaseVault.fork.t.sol      mainnet fork vs the real pool: flows + attack tests (needs ETH_RPC_URL)
+script/Deploy.s.sol                deploy (deployer = owner, pool fixed)
 ```
 
 Dependencies (git submodules, **pinned commits**): `forge-std`, `openzeppelin-contracts v5.4.0`, `Uniswap/v3-core@0.8`, `Uniswap/v3-periphery@0.8`.
@@ -29,37 +38,43 @@ Dependencies (git submodules, **pinned commits**): `forge-std`, `openzeppelin-co
 
 ## 2. Threat model
 
-Personal use means there are no third-party depositors, so there is no share math, no inflation attack, and no user-fund commingling. **These threats remain and drive every design decision:**
+Anyone can deposit, so assume attackers with flash loans, MEV bots and unlimited patience. **These threats drive every design decision:**
 
 | # | Threat | Mitigation (must never be weakened) |
 |---|--------|-------------------------------------|
-| T1 | **Keeper hot key leaks** (it lives on a server) | Keeper can call **only** `rebalance()`. It cannot withdraw, set params, set the pool, set itself, or choose any recipient. Worst case: it rebalances once per `minRebalanceInterval` and pays swap fees within `maxSlippageBps`. |
-| T2 | **Price manipulation / sandwich** of the rebalance swap | Spot-vs-TWAP deviation check; swap `sqrtPriceLimitX96` **and** min-out are derived from the **TWAP**, never spot; `maxTwapDeviationTicks < maxSlippageBps`; the bot submits through a private mempool (Flashbots Protect / MEV-Blocker). |
-| T3 | **Callback spoofing** (`uniswapV3MintCallback` / `uniswapV3SwapCallback`) | Callback requires `msg.sender == pool` **and** a transient in-flight flag set only by the vault right before `pool.mint` / `pool.swap`. |
-| T4 | **Wrong / malicious pool** | Pool is resolved only through the canonical factory `getPool(tokenA, tokenB, fee)`; raw pool addresses are never accepted. Pool can change only with no open position. |
-| T5 | **Owner key loss / compromise** | Owner should be a hardware wallet or Safe. Ownership is 2-step (`Ownable2Step`). |
-| T6 | **Token-level risk** | XAUT (Tether) and WBTC have admin freeze/blacklist powers. A frozen vault cannot be fixed on-chain; keep exposure sized accordingly. |
+| T1 | **Share-price manipulation** (Gamma-style, 2024): move the pool price, deposit cheaply, withdraw more | Deposit values the vault at **both spot and TWAP** and mints `min(shares_spot, shares_twap)`, so moving the price can only hurt the depositor. Deposit also reverts if `|spot − TWAP| > maxTwapDeviationTicks`. Withdraw is purely pro-rata (no price input). Fork test: `test_attack_depositSandwichIsNotProfitable`. |
+| T2 | **First-depositor / inflation attack** (donate to inflate share price, so the victim's shares round to 0) | `DEAD_SHARES` burned to `0x…dEaD` on first deposit, a high `INITIAL_SHARES_PER_UNIT` scale, user `minShares`, and `shares > 0` required. Fork test: `test_attack_inflationViaDonation`. |
+| T3 | **Stale-TWAP arbitrage** (real price moved; TWAP lags) | Same min(spot, TWAP) pricing plus the deviation check on deposit. |
+| T4 | **Unclaimed-fee theft** (deposit before fees are counted, withdraw after) | Every deposit and withdraw first pokes the position (`burn(…, 0)` + `collect`), so fees are in the books before shares are priced. |
+| T5 | **Keeper hot key leaks** | Keeper can call **only** `rebalance()`. It cannot withdraw, set params, set the keeper or choose a recipient. Worst case: a range move once per `minRebalanceInterval` and swaps within `maxSlippageBps` of the TWAP. |
+| T6 | **Sandwich of the rebalance swap** | Spot-vs-TWAP deviation check. Swap `sqrtPriceLimitX96` **and** min-out are derived from the **TWAP**. `maxTwapDeviationTicks < maxSlippageBps`. The bot uses a private mempool. |
+| T7 | **Callback spoofing** | Callback requires `msg.sender == pool` **and** a transient in-flight flag set only by the vault right before `pool.mint` / `pool.swap`. |
+| T8 | **Wrong / malicious pool** | Pool resolved via the canonical factory in the constructor; `immutable` afterwards. |
+| T9 | **Owner compromise** | The owner has **no path to funds**: worst case is pause (withdraw still works), bounded params, or a hostile keeper (bounded as in T5). |
+| T10 | **Exit blocked** | `withdraw` has no `whenNotPaused`, needs no keeper and no oracle. Never add a dependency that can block it. |
+| T11 | **Token-level risk** | XAUT and WBTC issuers can freeze addresses, including the vault. Disclose this to users. |
 
 ### Invariants (tests must keep proving these)
 
-- **I1** Funds leave the vault **only** to `owner()` (via `withdraw`) or to the configured `pool` (inside a vault-initiated mint/swap callback, exact owed amount).
-- **I2** `keeper` cannot change any state except via `rebalance()`.
-- **I3** Every swap is bounded by TWAP ± `maxSlippageBps` (price limit) and min-out vs. a TWAP quote.
-- **I4** `params` always satisfy the bounds in `_setParams` (constants in the contract).
-- **I5** `setPool` is impossible while `positionLiquidity() != 0`.
-- **I6** The vault never holds an ERC20 allowance to anyone. It uses direct pool calls plus callbacks, so there are no `approve` calls at all.
-- **I7** The vault cannot receive ETH (no `receive` / `fallback`).
+- **I1** Funds leave the vault **only** to a share holder in `withdraw` (to `msg.sender`, pro-rata to burned shares) or to `pool` inside a vault-initiated mint/swap callback (exact owed amount).
+- **I2** Neither `owner` nor `keeper` can move funds out of the vault.
+- **I3** A deposit can never increase the value per share of the depositor's shares at the expense of others (shares = min over spot/TWAP, rounded down).
+- **I4** `withdraw` is never blocked by pause, keeper state, or oracle state.
+- **I5** Every swap is bounded by TWAP ± `maxSlippageBps` (price limit) and min-out vs. a TWAP quote.
+- **I6** `params` always satisfy the bounds in `_setParams`.
+- **I7** `totalSupply() > 0` implies `DEAD_SHARES` were minted to `0x…dEaD`.
+- **I8** The vault never grants an ERC20 allowance to anyone and cannot receive ETH.
 
 ---
 
 ## 3. Hard rules (non-negotiable)
 
-1. **No upgradability.** No proxies, no `delegatecall`, no `selfdestruct`, no `CREATE2` redeploy tricks. To fix a bug: exit, withdraw, redeploy.
+1. **No upgradability.** No proxies, no `delegatecall`, no `selfdestruct`, no `CREATE2` redeploy tricks. To fix a bug: pause, `exitPosition`, ask users to withdraw, and deploy a new vault.
 2. **No arbitrary external calls.** No `call(data)` with caller-supplied target or calldata, no multicall, no "execute" escape hatch.
-3. **No new privileged roles** and no widening of keeper powers without explicit owner approval in the PR description.
-4. **Never use spot price (`slot0`) as an oracle** for anything value-sensitive. Spot is only used for range centering, and only after the TWAP-deviation check.
+3. **No new privileged roles**, no widening of keeper or owner powers, and **never any owner path to user funds** (no `rescue`, `sweep`, `skim`, `emergencyWithdraw(to)`, fee recipient, etc.) without explicit approval in the PR description.
+4. **Never use spot price (`slot0`) alone** for anything value-sensitive. Share pricing uses min(spot, TWAP), and swaps use the TWAP. Spot alone is only used for range centering, after the deviation check.
 5. **Never set `sqrtPriceLimitX96` to `MIN_SQRT_RATIO+1` / `MAX_SQRT_RATIO-1`** (i.e. "no limit") on a vault swap.
-6. **Never accept a recipient / `to` argument** in any function. Recipient is always `owner()` or `address(this)`.
+6. **Never accept a recipient / `to` argument** in any function. Shares mint to `msg.sender`, withdrawals pay `msg.sender`, and liquidity belongs to `address(this)`.
 7. **Every parameter has hard bounds** defined as `constant`s and checked in the setter. No unbounded `uint` knobs.
 8. **Pinned compiler** `pragma solidity 0.8.28;` (no `^`, no ranges) in `src/`.
 9. **No `unchecked`** blocks in `src/` unless you prove the bound in a comment and add a fuzz test for it.
@@ -68,6 +83,8 @@ Personal use means there are no third-party depositors, so there is no share mat
 12. **No private keys** in code, `.env`, shell history, or CI. Deploy with `--account <keystore>` or `--ledger`. Never `--private-key`.
 13. **No dependency bumps** (`forge update`, submodule moves) without reviewing the upstream diff and re-running the full fork suite.
 14. **`forge build` runs with `deny = "warnings"`.** Do not silence lints globally. A per-line `// forge-lint: disable-next-line(...)` needs a written justification on the line above.
+15. **Never gate `withdraw`** behind `whenNotPaused`, the keeper, the TWAP or any external condition.
+16. **Share math changes require attack tests** (sandwich, inflation, rounding) on the fork suite before merge.
 
 ---
 
@@ -98,8 +115,9 @@ Each entry follows the format **❌ antipattern → why it's dangerous → ✅ d
 - ❌ **One-step `transferOwnership`** → a typo bricks the vault forever → ✅ `Ownable2Step`.
 - ❌ **Keeper can set params / recipient / pool / keeper** → leaked bot key = drained vault → ✅ keeper only calls `rebalance`.
 - ❌ **Unprotected `initialize()`** (proxy pattern) → front-run takeover → ✅ constructor only, no proxies.
-- ❌ **`renounceOwnership` callable by mistake** → no one can ever withdraw → ✅ never call it. If you touch ownership, consider overriding it to revert.
-- ❌ **Same key for owner and keeper** → the T1 mitigation is void → ✅ the deploy script enforces `owner != keeper`. The owner is cold storage.
+- ❌ **`renounceOwnership` called by mistake** → nobody can pause or rotate a leaked keeper key → ✅ never call it. If you touch ownership, consider overriding it to revert.
+- ❌ **Owner "rescue" / "sweep" functions** for pool tokens → a rug path, even if well-intended → ✅ forbidden (rule 3.3). Donated tokens belong to share holders.
+- ❌ **Same key for owner and keeper** → the T5 mitigation is void → ✅ the deploy script enforces `keeper != deployer`. Deploy from cold storage (Ledger or keystore), never from the bot box.
 
 ### 5.2 Reentrancy
 - ❌ **External call before state update** (classic) → re-enter with stale state → ✅ CEI + `nonReentrant`.
@@ -131,10 +149,24 @@ Each entry follows the format **❌ antipattern → why it's dangerous → ✅ d
 - ❌ **`approve(spender, type(uint256).max)`** to routers or managers → one bug there drains the vault → ✅ no approvals at all (direct pool + callback).
 - ❌ **USDT-style approve-to-nonzero** → reverts → ✅ `forceApprove` if an approval ever becomes necessary (it shouldn't).
 - ❌ **Assuming 18 decimals** → WBTC = 8, XAUT = 6 → ✅ work in raw units; never hardcode decimals into price math.
-- ❌ **Ignoring token admin powers** (freeze, blacklist, pause, upgradeable token proxy) → funds stuck → ✅ documented accepted risk (T6). Monitor issuer announcements.
-- ❌ **`balanceOf(this)` used as accounting truth when others can donate** → manipulation of share math → ✅ acceptable here **only** because there are no shares. Never add share accounting on top of `balanceOf`.
+- ❌ **Ignoring token admin powers** (freeze, blacklist, pause, upgradeable token proxy) → funds stuck → ✅ documented accepted risk (T11). Monitor issuer announcements.
+- ❌ **Crediting deposits by `balanceOf` diff without a `deposit()` call**, or trusting the `amount` argument → fee-on-transfer and donation confusion → ✅ `_pull` measures the actual balance delta of `safeTransferFrom` in the same call. Raw transfers are donations.
 
-### 5.5 Math
+### 5.5 Vault share accounting (ERC4626-style risks)
+- ❌ **Valuing the vault at spot (`slot0`) when minting shares** → flash-loan price push, cheap shares (Gamma, Jan 2024) → ✅ `min(shares@spot, shares@TWAP)` plus the deviation check.
+- ❌ **Valuing at TWAP only** → when the real price moves, the stale TWAP lets arbitrageurs mint at an outdated price → ✅ use the min of both, never one alone.
+- ❌ **Position amounts computed at a manipulable price** (`getAmountsForLiquidity(slot0)`) inside share math → ✅ compute holdings at each price you value with (spot and TWAP separately).
+- ❌ **No dead shares / virtual offset** → first-depositor inflation attack → ✅ `DEAD_SHARES` minted to `0x…dEaD`, high initial share scale, `DepositTooSmall`.
+- ❌ **Rounding shares up on deposit or assets up on withdraw** → value leaks out one wei at a time, which is profitable at scale → ✅ round **down** on both (`mulDiv` floors).
+- ❌ **No `minShares` / `min0` / `min1` / `deadline`** on user functions → users are sandwiched → ✅ all four are mandatory parameters.
+- ❌ **Pricing shares before collecting fees** → depositors steal accrued fees → ✅ poke (`burn 0` + `collect`) first.
+- ❌ **Reading `totalSupply()` after `_mint` / `_burn`** in the same calculation → wrong ratio → ✅ snapshot `supply` before mutating it.
+- ❌ **Withdraw that swaps to a single token** → the exit can be sandwiched and manipulated → ✅ pro-rata in both tokens, no swap.
+- ❌ **Withdraw gated by pause, oracle or keeper** → funds held hostage → ✅ withdraw is unconditional (rule 3.15).
+- ❌ **Share price views (`totalAmounts`) consumed by other protocols** → read-only manipulation → ✅ views are spot-based and informational. Document it; never use them for pricing.
+- ❌ **Mint/burn ratio of liquidity ≠ share ratio** → withdrawer takes more than their slice → ✅ `burnLiquidity = L * shares / supply` (floor), using the same `supply` snapshot.
+
+### 5.6 Math
 - ❌ **Division before multiplication** → precision loss → ✅ multiply first, or `mulDiv`.
 - ❌ **Wrong rounding direction** → value leaks to the counterparty → ✅ round against the caller / in the vault's favour.
 - ❌ **Unsafe downcasts** (`uint128(x)`, `int24(x)`, `uint256(int)`) → silent truncation or sign flip → ✅ `SafeCast` / explicit bound checks.
@@ -143,7 +175,7 @@ Each entry follows the format **❌ antipattern → why it's dangerous → ✅ d
 - ❌ **Negative tick division rounding toward zero** → off-by-one-spacing range → ✅ `floorTick` rounds toward −∞.
 - ❌ **Bps ≈ ticks treated as exact** → 1 tick ≈ 1.0001× ≈ 1 bp only approximately → ✅ keep a margin. Enforce min-out separately.
 
-### 5.6 General Solidity
+### 5.7 General Solidity
 - ❌ **`delegatecall` to anything** → full storage takeover → ✅ forbidden.
 - ❌ **Arbitrary `call` with user data** → approve / transfer on behalf of the vault → ✅ forbidden.
 - ❌ **`selfdestruct`** → deprecated semantics, force-sends ETH → ✅ forbidden.
@@ -164,15 +196,16 @@ Each entry follows the format **❌ antipattern → why it's dangerous → ✅ d
 - ❌ **Relying on `private` for secrecy** → all storage is public → ✅ never store secrets on-chain.
 - ❌ **Using `transfer()` / `send()` for ETH** (2300 gas) → ✅ not applicable. If ETH is ever handled, use `Address.sendValue` with a reentrancy guard.
 
-### 5.7 Operational
+### 5.8 Operational
 - ❌ **Private key in `.env`, scripts or CLI flags** → leaked via history or logs → ✅ `cast wallet import` keystore or Ledger.
 - ❌ **Bot sends `rebalance` through the public mempool** → sandwich within the slippage bound → ✅ private RPC (Flashbots Protect, MEV-Blocker).
 - ❌ **Bot sets `deadline` far in the future or `minLiquidity = 0` blindly** → stale transaction executes later at a worse state → ✅ deadline ≈ now + 1–2 blocks. Simulate (`eth_call`) first and pass `minLiquidity` ≈ 99% of the simulated result.
 - ❌ **Bot retries on revert in a tight loop** → gas burn → ✅ treat `TwapDeviation`, `Cooldown` and `NothingToDo` as "wait", and back off.
 - ❌ **Deploy without a fork dry-run** → ✅ always `forge script … --fork-url` first.
-- ❌ **Forgetting `acceptOwnership()`** → the deployer hot key stays owner → ✅ the owner accepts right after deploy, then verify `owner()` on-chain.
-- ❌ **Switching pools with an open position** → orphaned liquidity → ✅ `exitPosition`, then `setPool` (enforced).
-- ❌ **No emergency path** → ✅ `pause()` stops the keeper. `exitPosition()` and `withdraw()` keep working while paused.
+- ❌ **Deploying from a hot key** → the deployer **is** the owner → ✅ deploy with `--ledger` or a cold keystore. Verify `owner()` and `keeper()` on-chain after deploy.
+- ❌ **Changing the pool of a live vault** → orphaned liquidity, mispriced shares → ✅ impossible: the pool is `immutable`. Deploy a new vault instead.
+- ❌ **No emergency path** → ✅ `pause()` stops deposits and the keeper. `exitPosition()` moves liquidity to idle, and users can always `withdraw()`.
+- ❌ **Bot ignores `Deposited` events** → user funds sit idle, earning nothing → ✅ the bot calls `rebalance()` after deposits. Same-range compounding has no cooldown.
 - ❌ **Unpinned or unreviewed dependency updates** → supply-chain risk → ✅ submodules pinned to a commit; review diffs before bumping.
 - ❌ **Large position in a thin pool** → the swap hits the TWAP limit, the fill is partial and capital sits idle → ✅ size the position relative to pool depth. Watch the `Swapped` events.
 
@@ -191,7 +224,6 @@ slither . --filter-paths lib                 # static analysis (pip install slit
 # deploy (dry-run first!)
 forge script script/Deploy.s.sol --fork-url $ETH_RPC_URL --sender <deployer>
 forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL --account <keystore> --broadcast --verify
-# then, from OWNER: acceptOwnership()
 ```
 
 ## 7. Definition of done for any change
@@ -199,7 +231,7 @@ forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL --account <keystore> --b
 - [ ] `forge build` is clean (no warnings, no lint errors) and `forge fmt --check` passes.
 - [ ] All tests pass, **including the fork suite** with a real `ETH_RPC_URL`.
 - [ ] Every new revert path has a test.
-- [ ] Invariants I1–I7 still hold, and none of the rules in §3 is violated.
+- [ ] Invariants I1–I8 still hold, and none of the rules in §3 is violated.
 - [ ] No new antipattern from §5 was introduced.
 - [ ] Slither shows no new high or medium findings, or each one is justified in the PR.
 - [ ] Any change to roles, params bounds or the swap / oracle logic is called out explicitly in the PR description.
