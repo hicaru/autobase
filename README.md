@@ -17,9 +17,14 @@ Security rules & antipatterns: [`AGENTS.md`](AGENTS.md) — read before changing
 ```bash
 forge build
 forge test                               # fork suite runs only with ETH_RPC_URL (archive node)
-cp .env.example .env                     # fill KEEPER / ETH_RPC_URL / MIN_DEPOSIT_VALUE
-forge script script/Deploy.s.sol --fork-url $ETH_RPC_URL --sender <deployer>          # dry-run
-forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL --ledger --broadcast --verify # deployer = owner
+cp .env.example .env                     # fill KEEPER / TOKEN_A / TOKEN_B / POOL_FEE / ETH_RPC_URL / MIN_DEPOSIT_VALUE
+forge script script/Deploy.s.sol --fork-url $ETH_RPC_URL --sender <deployer>          # dry-run (no wallet)
+# live deploy: the tx is signed in your browser wallet — the private key never leaves it.
+# `forge script` has no --browser in foundry 1.5.1, so the live deploy uses `forge create`.
+# Connect the wallet when http://localhost:9545 opens; ETHERSCAN_API_KEY is needed for --verify.
+forge create src/AutoBaseVault.sol:AutoBaseVault --rpc-url $ETH_RPC_URL --browser --verify \
+  --constructor-args $KEEPER 0x1F98431c8aD98523631AE4a59f267346ea31F984 $TOKEN_A $TOKEN_B $POOL_FEE \
+  "(420,1800,8000,600,100,150,3600,3600,$MIN_DEPOSIT_VALUE)"   # same params as Deploy.s.sol; deployer = owner
 ```
 
 ## Keeper bot (`bot/`)
