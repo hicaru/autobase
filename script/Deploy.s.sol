@@ -21,7 +21,9 @@ contract Deploy is Script {
         require(keeper != msg.sender, "keeper == owner");
 
         AutoBaseVault.Params memory params = AutoBaseVault.Params({
-            halfWidthTicks: 600,
+            minHalfWidthTicks: 420, // ~ +-4%
+            maxHalfWidthTicks: 1800, // ~ +-20%
+            recenterThresholdBps: 8000,
             twapWindow: 600,
             maxTwapDeviationTicks: 100,
             maxSlippageBps: 150,

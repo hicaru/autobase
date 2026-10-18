@@ -13,10 +13,10 @@ Rules for any human or AI agent touching this repository. **Security is the only
 | Role | Who | Can do | Can never do |
 |------|-----|---------|--------------|
 | **owner** | deployer (`Ownable(msg.sender)`; 2-step transfer) | `setKeeper`, `setParams` (bounded), `pause`/`unpause`, emergency `exitPosition` (funds stay in the vault) | withdraw, move or redirect user funds, change the pool |
-| **keeper** | bot on a VPS | `rebalance(minLiquidity, deadline)` only | anything else |
+| **keeper** | Rust bot on a VPS (`bot/`) | `rebalance(halfWidthTicks, minLiquidity, deadline)` only; the width must be within the owner's `[minHalfWidthTicks, maxHalfWidthTicks]` | anything else |
 | **user** | anyone | `deposit(amount0, amount1, minShares, deadline)` (value ≥ `minDepositValue`) → ERC20 shares (`ABLP`), locked for `depositLock`; `withdraw(shares, min0, min1, deadline)` → pro-rata token0 + token1 | affect other users' share value |
 
-**Owner-set params** (all bounded by constants in `_setParams`): `halfWidthTicks`, `twapWindow` (≥ 5 min), `maxTwapDeviationTicks` (< `maxSlippageBps`), `maxSlippageBps` (≤ 3%), `minRebalanceInterval` (≥ 10 min), `depositLock` (1 min – 1 day), `minDepositValue` (token1 base units, ≥ 1000; e.g. `100000` = 0.1 XAUT).
+**Owner-set params** (all bounded by constants in `_setParams`): `minHalfWidthTicks` / `maxHalfWidthTicks` (bounds for the keeper-chosen half width), `recenterThresholdBps` (5000–10000: the range may only move once the spot is this fraction of the half width away from the center, or out of range; otherwise `rebalance` only compounds into the current range), `twapWindow` (≥ 5 min), `maxTwapDeviationTicks` (< `maxSlippageBps`), `maxSlippageBps` (≤ 3%), `minRebalanceInterval` (≥ 10 min), `depositLock` (1 min – 1 day), `minDepositValue` (token1 base units, ≥ 1000; e.g. `100000` = 0.1 XAUT).
 
 **Flow**
 1. A user calls `approve` and then `deposit`. Funds sit **idle**, and the vault emits `Deposited`. A plain ERC20 `transfer` to the vault is a donation to all holders and credits nobody.
@@ -33,6 +33,7 @@ test/AutoBaseVault.access.t.sol    roles, params bounds, pause, deadlines, callb
 test/AutoBaseVault.fork.t.sol      mainnet fork vs the real pool: flows, attack tests, fork fuzz (needs ETH_RPC_URL)
 test/AutoBaseVault.invariant.t.sol stateful invariants on the fork: random deposit/withdraw/rebalance/market swaps
 script/Deploy.s.sol                deploy (deployer = owner, pool fixed)
+bot/                               Rust keeper bot (see §8)
 ```
 
 Dependencies (git submodules, **pinned commits**): `forge-std`, `openzeppelin-contracts v5.4.0`, `Uniswap/v3-core@0.8`, `Uniswap/v3-periphery@0.8`.
@@ -49,7 +50,7 @@ Anyone can deposit, so assume attackers with flash loans, MEV bots and unlimited
 | T2 | **First-depositor / inflation attack** (donate to inflate share price, so the victim's shares round to 0) | `DEAD_SHARES` burned to `0x…dEaD` on first deposit, a high `INITIAL_SHARES_PER_UNIT` scale, user `minShares`, and `shares > 0` required. Fork test: `test_attack_inflationViaDonation`. |
 | T3 | **Stale-TWAP arbitrage** (real price moved; TWAP lags) | Same minimum-over-price-views pricing plus the deviation check on deposit. |
 | T4 | **Unclaimed-fee theft** (deposit before fees are counted, withdraw after) | Every deposit and withdraw first pokes the position (`burn(…, 0)` + `collect`), so fees are in the books before shares are priced. |
-| T5 | **Keeper hot key leaks** | Keeper can call **only** `rebalance()`. It cannot withdraw, set params, set the keeper or choose a recipient. Worst case: a range move once per `minRebalanceInterval` and swaps within `maxSlippageBps` of the TWAP. |
+| T5 | **Keeper hot key leaks** | Keeper can call **only** `rebalance()`. It cannot withdraw, set params, set the keeper or choose a recipient. It picks the width only within owner bounds, and can only move the range once the on-chain re-center trigger is met (it cannot churn while the price is centered). Worst case: a range move once per `minRebalanceInterval` at a bounded width, with swaps within `maxSlippageBps` of the TWAP. |
 | T6 | **Sandwich of the rebalance swap** | Spot-vs-TWAP deviation check. Swap `sqrtPriceLimitX96` **and** min-out are derived from the **TWAP**. `maxTwapDeviationTicks < maxSlippageBps`. The bot uses a private mempool. |
 | T7 | **Callback spoofing** | Callback requires `msg.sender == pool` **and** a transient in-flight flag set only by the vault right before `pool.mint` / `pool.swap`. |
 | T8 | **Wrong / malicious pool** | Pool resolved via the canonical factory in the constructor; `immutable` afterwards. |
@@ -247,6 +248,7 @@ forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL --account <keystore> --b
 | `divide-before-multiply` | `RebalanceMath.floorTick` | Intentional: aligns a tick down to a multiple of `tickSpacing`. |
 | `incorrect-equality` | `== 0` checks on computed liquidity / amounts | Not balance comparisons, so they can't be manipulated by donations. |
 | `calls-loop` | `deposit` valuation loop | 3 iterations, calls go only to the pool tokens. |
+| `uninitialized-local` | `deposit` `values` | Fixed-size memory array, zero-initialized and fully written by the loop right below. |
 | `timestamp` | cooldown, deposit lock | Minute/hour granularity; validator skew is irrelevant. |
 | `unused-return` | `slot0` / `positions` / `consult` tuples, `burn(…, 0)` poke, `mint` | Intentionally unused fields. |
 
@@ -259,3 +261,41 @@ forge script script/Deploy.s.sol --rpc-url $ETH_RPC_URL --account <keystore> --b
 - [ ] No new antipattern from §5 was introduced.
 - [ ] Slither shows no new high or medium findings, or each one is justified in the PR.
 - [ ] Any change to roles, params bounds or the swap / oracle logic is called out explicitly in the PR description.
+
+---
+
+## 8. Keeper bot (`bot/`, Rust)
+
+```
+bot/src/main.rs       startup checks, secret handling, task supervisor, shutdown
+bot/src/config.rs     env/CLI → Config (shareable) + Secrets (signer, API key; zeroized, no Debug)
+bot/src/abi.rs        sol! interfaces (drift-checked against out/ by a test)
+bot/src/rpc.rs        RpcPool: primary + fallbacks, chain-id pinning, health, failover
+bot/src/tx.rs         local signing, private relays → public rebroadcast → same-nonce fee bumps
+bot/src/keeper.rs     decision loop (read → decide → eth_call simulate → send)
+bot/src/strategy.rs   pure: volatility → width, trigger mirror, decision rules
+bot/src/fees.rs       pure: Uniswap fee-growth math (pending/accrued fees)
+bot/src/indexer.rs    event tailing, hourly prices (archive backfill), snapshots
+bot/src/db.rs         DuckDB (static SQL + bound params only)
+bot/src/server.rs     JSON API (bearer auth, rate limit)
+```
+
+### Bot hard rules
+1. **The private key lives only in the env file** (`/etc/autobase-bot.env`, mode 600) and is removed from the process env at startup. Never log it, never put it in `Config`, never add `Debug`/`Display` to `Secrets`/`ApiKey`, never accept it as a CLI flag value in docs or scripts.
+2. **The bot refuses to start** if `vault.keeper() != signer`, if no RPC answers with the right chain id, or if `API_KEY` < 32 chars. Never weaken these checks.
+3. **Always simulate (`eth_call` from the keeper) before sending**, and send with `minLiquidity` = 99% of the simulated result and an on-chain `deadline`. Never send blind.
+4. **Transactions go to private relays first** (`PRIVATE_TX_RPCS`). Public broadcast is only a fallback. Fees are capped by `MAX_FEE_GWEI`, including bumps.
+5. **One transaction in flight**, persisted in `pending_tx` before broadcast. `resume()` finishes it after a restart; leftover `simulating`/`sent` actions are closed as `interrupted`.
+6. **Reverts are not node failures.** `RpcPool` returns reverts immediately (decoded into vault error names) instead of failing over.
+7. **API:** every route except `/healthz` needs `Authorization: Bearer`. Keys are compared via constant-time hash comparison. Rate-limited per IP before auth. Bind to `127.0.0.1` and put a TLS reverse proxy in front if it must be reachable. Responses never contain secrets, full RPC URLs (which may embed keys), or internal error text.
+8. **SQL:** only `&'static str` statements with bound parameters. Never format user input into SQL.
+9. **Rust:** `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean. No `unwrap()`/`expect()` on runtime data outside tests. Keep strategy/fee math pure and unit-tested; the trigger in `strategy.rs` must stay identical to `RebalanceMath.recenterTriggered`.
+
+### Bot commands
+```bash
+cd bot
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo build --release   # binary: target/release/autobase-bot
+# deploy: copy binary to /usr/local/bin, env to /etc/autobase-bot.env (600), install deploy/autobase-bot.service
+```
+

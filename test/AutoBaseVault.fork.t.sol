@@ -23,6 +23,7 @@ contract AutoBaseVaultForkTest is Test {
     address internal constant XAUT = 0x68749665FF8D2d112Fa859AA293F07A622782F38;
     uint24 internal constant FEE = 3000;
     uint256 internal constant FORK_BLOCK = 26_220_000;
+    int24 internal constant WIDTH = 600;
 
     AutoBaseVault internal vault;
     IUniswapV3Pool internal pool;
@@ -54,7 +55,9 @@ contract AutoBaseVaultForkTest is Test {
 
     function _params() internal pure returns (AutoBaseVault.Params memory) {
         return AutoBaseVault.Params({
-            halfWidthTicks: 600,
+            minHalfWidthTicks: 60,
+            maxHalfWidthTicks: 1800,
+            recenterThresholdBps: 8000,
             twapWindow: 600,
             maxTwapDeviationTicks: 100,
             maxSlippageBps: 150,
@@ -91,7 +94,7 @@ contract AutoBaseVaultForkTest is Test {
 
     function _rebalance() internal {
         vm.prank(keeper);
-        vault.rebalance(0, block.timestamp);
+        vault.rebalance(WIDTH, 0, block.timestamp);
     }
 
     function _value(uint256 a0, uint256 a1) internal view returns (uint256) {
@@ -306,7 +309,7 @@ contract AutoBaseVaultForkTest is Test {
         _skip(30 minutes);
         vm.prank(keeper);
         vm.expectRevert(AutoBaseVault.Cooldown.selector);
-        vault.rebalance(0, block.timestamp);
+        vault.rebalance(WIDTH, 0, block.timestamp);
     }
 
     function test_rebalance_revertsOnSpotManipulation() public {
@@ -317,7 +320,7 @@ contract AutoBaseVaultForkTest is Test {
         _movePrice(_spotTick() - 400); // same block: TWAP has not moved, spot has
         vm.prank(keeper);
         vm.expectPartialRevert(AutoBaseVault.TwapDeviation.selector);
-        vault.rebalance(0, block.timestamp);
+        vault.rebalance(WIDTH, 0, block.timestamp);
     }
 
     function test_rebalance_eventuallyNothingToDo() public {
@@ -326,7 +329,7 @@ contract AutoBaseVaultForkTest is Test {
         for (uint256 i; i < 5; ++i) {
             _skip(60);
             vm.prank(keeper);
-            try vault.rebalance(0, block.timestamp) {}
+            try vault.rebalance(WIDTH, 0, block.timestamp) {}
             catch (bytes memory err) {
                 assertEq(err, abi.encodeWithSelector(AutoBaseVault.NothingToDo.selector));
                 return;
@@ -335,11 +338,71 @@ contract AutoBaseVaultForkTest is Test {
         revert("never reached NothingToDo");
     }
 
+    function test_rebalance_usesKeeperWidth() public {
+        _deposit(alice, 0.2e8, 4e6);
+        vm.prank(keeper);
+        vault.rebalance(300, 0, block.timestamp);
+        int24 span = vault.tickUpper() - vault.tickLower();
+        assertGe(span, 600); // 2 * 300, aligned outward to the 60-tick spacing
+        assertLe(span, 720);
+        _assertCentered();
+    }
+
+    function test_rebalance_returnsAddedLiquidity() public {
+        _deposit(alice, 0.2e8, 4e6);
+        vm.prank(keeper);
+        uint128 added = vault.rebalance(WIDTH, 0, block.timestamp);
+        assertEq(added, vault.positionLiquidity());
+    }
+
+    function test_trigger_blocksRecenterWhileCentered() public {
+        _deposit(alice, 0.2e8, 4e6);
+        _rebalance();
+        int24 lower = vault.tickLower();
+        int24 upper = vault.tickUpper();
+
+        _movePrice(_spotTick() + 200); // ~1/3 of the half width: below the 80% trigger
+        _skip(2 hours); // cooldown passed, TWAP caught up
+        _deposit(bob, 0.1e8, 0); // something to compound
+
+        vm.prank(keeper);
+        vault.rebalance(1200, 0, block.timestamp); // different width requested ...
+        assertEq(vault.tickLower(), lower); // ... but the range must not move
+        assertEq(vault.tickUpper(), upper);
+    }
+
+    function test_trigger_allowsRecenterPastThreshold() public {
+        _deposit(alice, 0.2e8, 4e6);
+        _rebalance();
+        int24 lower = vault.tickLower();
+        int24 upper = vault.tickUpper();
+        int24 center = (lower + upper) / 2;
+
+        // Push past 80% of the half width while staying inside the range.
+        _movePrice(center + (upper - center) * 85 / 100);
+        assertLt(_spotTick(), upper);
+        _skip(2 hours);
+
+        _rebalance();
+        assertTrue(vault.tickLower() != lower);
+        _assertCentered();
+    }
+
+    function test_rebalance_revertsOnInvalidWidth() public {
+        _deposit(alice, 0.2e8, 4e6);
+        vm.startPrank(keeper);
+        vm.expectRevert(AutoBaseVault.InvalidWidth.selector);
+        vault.rebalance(59, 0, block.timestamp);
+        vm.expectRevert(AutoBaseVault.InvalidWidth.selector);
+        vault.rebalance(1801, 0, block.timestamp);
+        vm.stopPrank();
+    }
+
     function test_rebalance_revertsBelowMinLiquidity() public {
         _deposit(alice, 0.2e8, 4e6);
         vm.prank(keeper);
         vm.expectPartialRevert(AutoBaseVault.InsufficientLiquidity.selector);
-        vault.rebalance(type(uint128).max, block.timestamp);
+        vault.rebalance(WIDTH, type(uint128).max, block.timestamp);
     }
 
     function test_rebalance_largeSwapIsCappedByTwapLimit() public {
@@ -563,7 +626,7 @@ contract AutoBaseVaultForkTest is Test {
         _skip(20 minutes); // let the TWAP absorb the vault's own rebalance swap
         _deposit(bob, b0, b1);
         vm.prank(keeper);
-        try vault.rebalance(0, block.timestamp) {} catch {} // may be NothingToDo for tiny deposits
+        try vault.rebalance(WIDTH, 0, block.timestamp) {} catch {} // may be NothingToDo for tiny deposits
 
         (uint256 oa0, uint256 oa1) = _withdrawAll(alice);
         (uint256 ob0, uint256 ob1) = _withdrawAll(bob);

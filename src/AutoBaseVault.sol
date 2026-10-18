@@ -38,8 +38,11 @@ contract AutoBaseVault is
     using SafeERC20 for IERC20;
 
     struct Params {
-        /// @dev Half range width in ticks (~1 bp per tick).
-        int24 halfWidthTicks;
+        /// @dev Bounds for the keeper-chosen half range width in ticks (~1 bp per tick).
+        int24 minHalfWidthTicks;
+        int24 maxHalfWidthTicks;
+        /// @dev The range may only move once |spot - center| >= this fraction of the half width (or out of range).
+        uint16 recenterThresholdBps;
         /// @dev TWAP window in seconds used as the reference price.
         uint32 twapWindow;
         /// @dev Max allowed |spot tick - TWAP tick| for rebalance and deposit.
@@ -58,6 +61,7 @@ contract AutoBaseVault is
     uint256 internal constant BPS = 10_000;
     int24 public constant MIN_HALF_WIDTH = 10;
     int24 public constant MAX_HALF_WIDTH = 100_000;
+    uint16 public constant MIN_RECENTER_THRESHOLD_BPS = 5_000;
     uint32 public constant MIN_TWAP_WINDOW = 5 minutes;
     uint32 public constant MAX_TWAP_WINDOW = 1 hours;
     int24 public constant MAX_TWAP_DEVIATION = 1_000;
@@ -93,6 +97,15 @@ contract AutoBaseVault is
     /// @notice Timestamp until which an account's shares cannot be withdrawn or transferred.
     mapping(address account => uint256) public lockedUntil;
 
+    struct RangePlan {
+        int24 oldLower;
+        int24 oldUpper;
+        int24 newLower;
+        int24 newUpper;
+        uint128 liquidity;
+        bool move;
+    }
+
     /// @dev Set only while this contract is inside a pool.mint / pool.swap call it initiated.
     bool private transient _expectingCallback;
 
@@ -105,6 +118,7 @@ contract AutoBaseVault is
         int24 oldUpper,
         int24 newLower,
         int24 newUpper,
+        int24 halfWidthTicks,
         uint128 liquidityAdded,
         uint256 fees0,
         uint256 fees1
@@ -117,6 +131,7 @@ contract AutoBaseVault is
     error NotKeeper();
     error PoolNotFound();
     error InvalidParams();
+    error InvalidWidth();
     error Expired();
     error Cooldown();
     error TwapDeviation(int24 spotTick, int24 twapTick);
@@ -274,49 +289,36 @@ contract AutoBaseVault is
     // Keeper
     // ------------------------------------------------------------------
 
-    /// @notice Re-centers the position around the current price if the range changed (subject to cooldown),
-    ///         otherwise compounds fees and idle deposits into the current range.
+    /// @notice Re-centers the position around the current price with half width `halfWidthTicks` once the
+    ///         re-center trigger is met (subject to cooldown); otherwise compounds fees and idle deposits into
+    ///         the current range (width ignored).
+    /// @param halfWidthTicks Keeper-chosen half width, must be within the owner's [min, max] bounds.
     /// @param minLiquidity Keeper-side floor on the liquidity added by this call.
     /// @param deadline Transaction is rejected after this timestamp.
-    function rebalance(uint128 minLiquidity, uint256 deadline)
+    /// @return added Liquidity added by this call (lets the keeper simulate via eth_call).
+    function rebalance(int24 halfWidthTicks, uint128 minLiquidity, uint256 deadline)
         external
         onlyKeeper
         whenNotPaused
         nonReentrant
         checkDeadline(deadline)
+        returns (uint128 added)
     {
         Params memory cfg = params;
+        if (halfWidthTicks < cfg.minHalfWidthTicks || halfWidthTicks > cfg.maxHalfWidthTicks) revert InvalidWidth();
         (, int24 spotTick,,,,,) = pool.slot0();
         int24 twapTick = _twapTick(cfg.twapWindow);
         _checkDeviation(spotTick, twapTick, cfg.maxTwapDeviationTicks);
 
-        (int24 newLower, int24 newUpper) = RebalanceMath.rangeAround(spotTick, cfg.halfWidthTicks, tickSpacing);
-        int24 oldLower = tickLower;
-        int24 oldUpper = tickUpper;
-        uint128 liquidity = _positionLiquidity();
-        bool moveRange = liquidity == 0 || newLower != oldLower || newUpper != oldUpper;
+        RangePlan memory r = _planRange(spotTick, halfWidthTicks, cfg.recenterThresholdBps);
+        (uint256 fees0, uint256 fees1) = _applyRange(r, cfg.minRebalanceInterval);
 
-        uint256 fees0;
-        uint256 fees1;
-        if (moveRange) {
-            if (lastRebalance != 0 && block.timestamp < lastRebalance + cfg.minRebalanceInterval) revert Cooldown();
-            // Effects before interactions with the pool.
-            lastRebalance = block.timestamp;
-            tickLower = newLower;
-            tickUpper = newUpper;
-            if (liquidity != 0) (,, fees0, fees1) = _burnAndCollect(oldLower, oldUpper);
-        } else {
-            newLower = oldLower;
-            newUpper = oldUpper;
-            (fees0, fees1) = _collectFees();
-        }
-
-        _swapToRatio(twapTick, cfg.maxSlippageBps, newLower, newUpper);
-        uint128 added = _mint(newLower, newUpper);
-        if (added == 0 && !moveRange) revert NothingToDo();
+        _swapToRatio(twapTick, cfg.maxSlippageBps, r.newLower, r.newUpper);
+        added = _mint(r.newLower, r.newUpper);
+        if (added == 0 && !r.move) revert NothingToDo();
         if (added == 0 || added < minLiquidity) revert InsufficientLiquidity(added, minLiquidity);
 
-        emit Rebalanced(oldLower, oldUpper, newLower, newUpper, added, fees0, fees1);
+        emit Rebalanced(r.oldLower, r.oldUpper, r.newLower, r.newUpper, halfWidthTicks, added, fees0, fees1);
     }
 
     // ------------------------------------------------------------------
@@ -361,9 +363,10 @@ contract AutoBaseVault is
 
     function _setParams(Params memory p) internal {
         if (
-            p.halfWidthTicks < MIN_HALF_WIDTH || p.halfWidthTicks > MAX_HALF_WIDTH || p.twapWindow < MIN_TWAP_WINDOW
-                || p.twapWindow > MAX_TWAP_WINDOW || p.maxTwapDeviationTicks <= 0
-                || p.maxTwapDeviationTicks > MAX_TWAP_DEVIATION || p.maxSlippageBps == 0
+            p.minHalfWidthTicks < MIN_HALF_WIDTH || p.maxHalfWidthTicks > MAX_HALF_WIDTH
+                || p.minHalfWidthTicks > p.maxHalfWidthTicks || p.recenterThresholdBps < MIN_RECENTER_THRESHOLD_BPS
+                || p.recenterThresholdBps > BPS || p.twapWindow < MIN_TWAP_WINDOW || p.twapWindow > MAX_TWAP_WINDOW
+                || p.maxTwapDeviationTicks <= 0 || p.maxTwapDeviationTicks > MAX_TWAP_DEVIATION || p.maxSlippageBps == 0
                 || p.maxSlippageBps > MAX_SLIPPAGE_BPS
                 // Swap price limit (TWAP +/- slippage) must stay beyond any allowed spot price.
                 || int256(p.maxTwapDeviationTicks) >= int256(uint256(p.maxSlippageBps))
@@ -410,6 +413,38 @@ contract AutoBaseVault is
             if (block.timestamp < until) revert SharesLocked(until);
         }
         super._update(from, to, value);
+    }
+
+    /// @dev Decides whether the range moves: only with no position, or once the re-center trigger is met and
+    ///      the new range actually differs. Otherwise the current range is kept (compound).
+    function _planRange(int24 spotTick, int24 halfWidthTicks, uint16 thresholdBps)
+        internal
+        view
+        returns (RangePlan memory r)
+    {
+        r.oldLower = tickLower;
+        r.oldUpper = tickUpper;
+        r.newLower = r.oldLower;
+        r.newUpper = r.oldUpper;
+        r.liquidity = _positionLiquidity();
+        if (r.liquidity != 0 && !RebalanceMath.recenterTriggered(spotTick, r.oldLower, r.oldUpper, thresholdBps)) {
+            return r;
+        }
+        (int24 lower, int24 upper) = RebalanceMath.rangeAround(spotTick, halfWidthTicks, tickSpacing);
+        if (r.liquidity != 0 && lower == r.oldLower && upper == r.oldUpper) return r;
+        r.newLower = lower;
+        r.newUpper = upper;
+        r.move = true;
+    }
+
+    /// @dev Moves the range (cooldown-checked, effects before interactions) or just collects fees.
+    function _applyRange(RangePlan memory r, uint32 minInterval) internal returns (uint256 fees0, uint256 fees1) {
+        if (!r.move) return _collectFees();
+        if (lastRebalance != 0 && block.timestamp < lastRebalance + minInterval) revert Cooldown();
+        lastRebalance = block.timestamp;
+        tickLower = r.newLower;
+        tickUpper = r.newUpper;
+        if (r.liquidity != 0) (,, fees0, fees1) = _burnAndCollect(r.oldLower, r.oldUpper);
     }
 
     function _checkCallback() internal view {

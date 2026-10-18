@@ -28,6 +28,7 @@ contract MockFactory {
 }
 
 contract AutoBaseVaultAccessTest is Test {
+    int24 internal constant WIDTH = 600;
     AutoBaseVault internal vault;
     IUniswapV3Factory internal factory;
     address internal keeper = makeAddr("keeper");
@@ -40,7 +41,9 @@ contract AutoBaseVaultAccessTest is Test {
 
     function defaultParams() internal pure returns (AutoBaseVault.Params memory) {
         return AutoBaseVault.Params({
-            halfWidthTicks: 600,
+            minHalfWidthTicks: 60,
+            maxHalfWidthTicks: 1800,
+            recenterThresholdBps: 8000,
             twapWindow: 600,
             maxTwapDeviationTicks: 100,
             maxSlippageBps: 150,
@@ -129,7 +132,7 @@ contract AutoBaseVaultAccessTest is Test {
         AutoBaseVault.Params memory p = defaultParams();
         p.minDepositValue = 5e6;
         vault.setParams(p);
-        (,,,,,, uint128 minDeposit) = vault.params();
+        (,,,,,,,, uint128 minDeposit) = vault.params();
         assertEq(minDeposit, 5e6);
     }
 
@@ -146,10 +149,19 @@ contract AutoBaseVaultAccessTest is Test {
         AutoBaseVault.Params memory p;
 
         p = defaultParams();
-        p.halfWidthTicks = vault.MIN_HALF_WIDTH() - 1;
+        p.minHalfWidthTicks = vault.MIN_HALF_WIDTH() - 1;
         _expectInvalid(p);
         p = defaultParams();
-        p.halfWidthTicks = vault.MAX_HALF_WIDTH() + 1;
+        p.maxHalfWidthTicks = vault.MAX_HALF_WIDTH() + 1;
+        _expectInvalid(p);
+        p = defaultParams();
+        p.minHalfWidthTicks = p.maxHalfWidthTicks + 1; // min > max
+        _expectInvalid(p);
+        p = defaultParams();
+        p.recenterThresholdBps = vault.MIN_RECENTER_THRESHOLD_BPS() - 1;
+        _expectInvalid(p);
+        p = defaultParams();
+        p.recenterThresholdBps = 10_001;
         _expectInvalid(p);
         p = defaultParams();
         p.twapWindow = vault.MIN_TWAP_WINDOW() - 1;
@@ -198,17 +210,26 @@ contract AutoBaseVaultAccessTest is Test {
 
     function test_rebalance_revertsForNonKeeper() public {
         vm.expectRevert(AutoBaseVault.NotKeeper.selector);
-        vault.rebalance(0, block.timestamp);
+        vault.rebalance(WIDTH, 0, block.timestamp);
         vm.prank(attacker);
         vm.expectRevert(AutoBaseVault.NotKeeper.selector);
-        vault.rebalance(0, block.timestamp);
+        vault.rebalance(WIDTH, 0, block.timestamp);
+    }
+
+    function test_rebalance_revertsOnInvalidWidth() public {
+        vm.startPrank(keeper);
+        vm.expectRevert(AutoBaseVault.InvalidWidth.selector);
+        vault.rebalance(59, 0, block.timestamp);
+        vm.expectRevert(AutoBaseVault.InvalidWidth.selector);
+        vault.rebalance(1801, 0, block.timestamp);
+        vm.stopPrank();
     }
 
     function test_rebalance_revertsWhenPaused() public {
         vault.pause();
         vm.prank(keeper);
         vm.expectRevert(Pausable.EnforcedPause.selector);
-        vault.rebalance(0, block.timestamp);
+        vault.rebalance(WIDTH, 0, block.timestamp);
     }
 
     function test_deposit_revertsWhenPaused() public {
@@ -222,7 +243,7 @@ contract AutoBaseVaultAccessTest is Test {
         vm.warp(1000);
         vm.prank(keeper);
         vm.expectRevert(AutoBaseVault.Expired.selector);
-        vault.rebalance(0, 999);
+        vault.rebalance(WIDTH, 0, 999);
         vm.startPrank(attacker);
         vm.expectRevert(AutoBaseVault.Expired.selector);
         vault.deposit(1, 1, 0, 999);

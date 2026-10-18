@@ -1,0 +1,38 @@
+[Unit]
+Description=AutoBase keeper bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/autobase-bot
+# chmod 600, root-owned. Holds KEEPER_PRIVATE_KEY and API_KEY.
+EnvironmentFile=/etc/autobase-bot.env
+Restart=always
+RestartSec=5
+
+# Sandboxing
+DynamicUser=yes
+StateDirectory=autobase-bot
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# No core dumps: they could contain the key.
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

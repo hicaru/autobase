@@ -32,6 +32,16 @@ library RebalanceMath {
         if (upper > maxUsable) upper = maxUsable;
     }
 
+    /// @notice True when the range should move: `tick` is outside [`lower`, `upper`) or its distance from the
+    ///         range center is at least `thresholdBps` of the half width.
+    function recenterTriggered(int24 tick, int24 lower, int24 upper, uint16 thresholdBps) internal pure returns (bool) {
+        if (tick < lower || tick >= upper) return true;
+        // Compare in doubled units to avoid rounding the center: |2*tick - (lower+upper)| vs (upper-lower).
+        int256 dist2 = 2 * int256(tick) - int256(lower) - int256(upper);
+        if (dist2 < 0) dist2 = -dist2;
+        return dist2 * 10_000 >= (int256(upper) - int256(lower)) * int256(uint256(thresholdBps));
+    }
+
     /// @notice Converts an amount of token0 into token1 at `sqrtPriceX96` (rounded down).
     function toToken1(uint256 amount0, uint160 sqrtPriceX96) internal pure returns (uint256) {
         return FullMath.mulDiv(FullMath.mulDiv(amount0, sqrtPriceX96, FixedPoint96.Q96), sqrtPriceX96, FixedPoint96.Q96);

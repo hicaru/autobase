@@ -77,9 +77,10 @@ contract VaultHandler is Test {
         }
     }
 
-    function rebalance() external {
+    function rebalance(int24 width) external {
+        width = int24(bound(width, 60, 1800));
         vm.prank(keeper);
-        try vault.rebalance(0, block.timestamp) {
+        try vault.rebalance(width, 0, block.timestamp) {
             ++rebalances;
         } catch {}
     }
@@ -134,7 +135,9 @@ contract AutoBaseVaultInvariantTest is Test {
             XAUT,
             3000,
             AutoBaseVault.Params({
-                halfWidthTicks: 600,
+                minHalfWidthTicks: 60,
+                maxHalfWidthTicks: 1800,
+                recenterThresholdBps: 8000,
                 twapWindow: 600,
                 maxTwapDeviationTicks: 100,
                 maxSlippageBps: 150,

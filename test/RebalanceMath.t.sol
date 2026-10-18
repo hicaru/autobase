@@ -49,6 +49,48 @@ contract RebalanceMathTest is Test {
         assertLt(lower, upper);
     }
 
+    function test_recenterTriggered() public pure {
+        // Range [-600, 600): center 0, half width 600, threshold 80% -> trigger at |tick| >= 480.
+        assertFalse(RebalanceMath.recenterTriggered(0, -600, 600, 8000));
+        assertFalse(RebalanceMath.recenterTriggered(479, -600, 600, 8000));
+        assertTrue(RebalanceMath.recenterTriggered(480, -600, 600, 8000));
+        assertFalse(RebalanceMath.recenterTriggered(-479, -600, 600, 8000));
+        assertTrue(RebalanceMath.recenterTriggered(-480, -600, 600, 8000));
+        // Out of range always triggers (upper bound is exclusive).
+        assertTrue(RebalanceMath.recenterTriggered(600, -600, 600, 8000));
+        assertTrue(RebalanceMath.recenterTriggered(-601, -600, 600, 8000));
+        // Threshold 100% -> only out of range.
+        assertFalse(RebalanceMath.recenterTriggered(599, -600, 600, 10_000));
+    }
+
+    function testFuzz_recenterTriggered_properties(int24 tick, int24 lower, int24 halfWidth, uint16 bps) public pure {
+        lower = int24(bound(lower, -800_000, 600_000));
+        halfWidth = int24(bound(halfWidth, 1, 50_000));
+        int24 upper = lower + 2 * halfWidth;
+        int24 center = lower + halfWidth;
+        bps = uint16(bound(bps, 5000, 10_000));
+        tick = int24(bound(tick, lower - 1000, upper + 1000));
+
+        // Out of range always triggers; the exact center never does.
+        if (tick < lower || tick >= upper) assertTrue(RebalanceMath.recenterTriggered(tick, lower, upper, bps));
+        assertFalse(RebalanceMath.recenterTriggered(center, lower, upper, bps));
+        // Monotonic: moving further from the center never un-triggers.
+        if (tick >= center && RebalanceMath.recenterTriggered(tick, lower, upper, bps)) {
+            assertTrue(RebalanceMath.recenterTriggered(tick + 1, lower, upper, bps));
+        }
+        if (tick <= center && RebalanceMath.recenterTriggered(tick, lower, upper, bps)) {
+            assertTrue(RebalanceMath.recenterTriggered(tick - 1, lower, upper, bps));
+        }
+        // Symmetric around the center (inside the range).
+        int24 d = tick - center;
+        if (d > -halfWidth && d < halfWidth) {
+            assertEq(
+                RebalanceMath.recenterTriggered(center + d, lower, upper, bps),
+                RebalanceMath.recenterTriggered(center - d, lower, upper, bps)
+            );
+        }
+    }
+
     function test_computeSwap_outsideRange() public pure {
         uint160 sqrtA = TickMath.getSqrtRatioAtTick(-600);
         uint160 sqrtB = TickMath.getSqrtRatioAtTick(600);

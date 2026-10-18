@@ -11,3 +11,9 @@ keystore/
 
 # Misc
 .DS_Store
+
+# Bot
+bot/target/
+*.duckdb
+*.duckdb.wal
+bot/.env
