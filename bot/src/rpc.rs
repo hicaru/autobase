@@ -18,7 +18,7 @@ use alloy::{
     providers::{Provider, RootProvider},
     rpc::{client::RpcClient, types::TransactionRequest},
     sol_types::SolCall,
-    transports::{TransportError, http::Http},
+    transports::TransportError,
 };
 use reqwest::Url;
 use serde::Serialize;
@@ -62,7 +62,7 @@ impl Endpoint {
             .timeout(timeout)
             .connect_timeout(timeout)
             .build()?;
-        let rpc = RpcClient::new(Http::with_client(client, url), false);
+        let rpc = RpcClient::new_http_with_client(client, url);
         let stats = EndpointStatus {
             name: name.clone(),
             healthy: true,

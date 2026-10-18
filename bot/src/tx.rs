@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 use alloy::{
     consensus::TxEnvelope,
     eips::{BlockNumberOrTag, eip2718::Encodable2718},
-    network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder},
+    network::{EthereumWallet, TransactionBuilder},
     primitives::{Address, B256, Bytes},
     providers::Provider,
     rpc::types::{TransactionReceipt, TransactionRequest},
