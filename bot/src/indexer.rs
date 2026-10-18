@@ -10,7 +10,7 @@ use alloy::{
     rpc::types::{Filter, Log},
     sol_types::SolEvent,
 };
-use duckdb::ToSql;
+use rusqlite::ToSql;
 use tracing::{debug, info, warn};
 
 use crate::{

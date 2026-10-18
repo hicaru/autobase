@@ -53,7 +53,7 @@ pub struct Cli {
     #[arg(long, env = "API_BIND", default_value = "127.0.0.1:8080")]
     pub api_bind: SocketAddr,
 
-    #[arg(long, env = "DB_PATH", default_value = "autobase.duckdb")]
+    #[arg(long, env = "DB_PATH", default_value = "autobase.sqlite")]
     pub db_path: PathBuf,
 
     /// Strategy: target days the price should stay in range (width = σ_daily · √days).

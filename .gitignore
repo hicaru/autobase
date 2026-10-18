@@ -13,6 +13,7 @@ keystore/
 
 # Bot
 bot/target/
-*.duckdb
-*.duckdb.wal
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
 bot/.env

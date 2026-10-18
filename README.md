@@ -52,7 +52,7 @@ Rust service that watches the vault and calls `rebalance()`:
 - **Reads:** your node first (`PRIMARY_RPC`, default `https://eth.bearby.ru`), with automatic failover to public nodes.
 - **Transactions:** sent through private relays (Flashbots Protect / MEV-Blocker), with public rebroadcast and fee bumps if they aren't included.
 - **Width:** chosen from realized volatility (`σ_daily · √TARGET_DAYS_IN_RANGE`) within the owner's bounds.
-- **Analytics:** stored in DuckDB and served by an API-key-protected JSON API.
+- **Analytics:** stored in SQLite and served by an API-key-protected JSON API.
 
 ```bash
 cd bot && cp .env.example .env   # fill KEEPER_PRIVATE_KEY, VAULT_ADDRESS, API_KEY (openssl rand -hex 32)

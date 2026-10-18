@@ -1,4 +1,4 @@
-//! DuckDB storage. One connection behind a mutex; every call runs on the blocking pool.
+//! SQLite storage. One connection behind a mutex; every call runs on the blocking pool.
 //! SQL is always static text with bound parameters — never string-interpolated input.
 
 use std::{
@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use duckdb::{Connection, ToSql, params, types::ValueRef};
+use rusqlite::{Connection, ToSql, params, types::ValueRef};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -37,9 +37,8 @@ CREATE TABLE IF NOT EXISTS swaps (block BIGINT, log_index INTEGER, tx_hash VARCH
 CREATE TABLE IF NOT EXISTS admin_events (block BIGINT, log_index INTEGER, tx_hash VARCHAR, ts BIGINT,
     kind VARCHAR, detail VARCHAR, PRIMARY KEY (block, log_index));
 
-CREATE SEQUENCE IF NOT EXISTS action_id;
 CREATE TABLE IF NOT EXISTS actions (
-    id BIGINT PRIMARY KEY DEFAULT nextval('action_id'), ts BIGINT NOT NULL, decision VARCHAR NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts BIGINT NOT NULL, decision VARCHAR NOT NULL,
     reason VARCHAR, half_width INTEGER, tx_hash VARCHAR, status VARCHAR NOT NULL,
     gas_used BIGINT, gas_cost_wei VARCHAR, error VARCHAR
 );
@@ -91,6 +90,8 @@ pub struct PendingTx {
 impl Db {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let conn = Connection::open(path)?;
+        // WAL with the default synchronous=FULL: `pending_tx` must be durable before broadcast.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self(Arc::new(Mutex::new(conn))))
     }
@@ -106,7 +107,7 @@ impl Db {
     pub async fn run<T, F>(&self, f: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Connection) -> duckdb::Result<T> + Send + 'static,
+        F: FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
     {
         let db = self.0.clone();
         let out = tokio::task::spawn_blocking(move || {
@@ -315,14 +316,19 @@ impl Db {
     pub async fn query_json(&self, sql: &'static str, args: Vec<i64>) -> anyhow::Result<Vec<Value>> {
         self.run(move |c| {
             let mut s = c.prepare(sql)?;
+            // SQLite has no boolean type: columns declared BOOLEAN come back as 0/1 and are mapped to JSON bools.
+            let cols: Vec<(String, bool)> = s
+                .columns()
+                .iter()
+                .map(|col| (col.name().to_string(), col.decl_type() == Some("BOOLEAN")))
+                .collect();
             let refs: Vec<&dyn ToSql> = args.iter().map(|a| a as &dyn ToSql).collect();
             let mut rows = s.query(refs.as_slice())?;
-            let names = rows.as_ref().map(|s| s.column_names()).unwrap_or_default();
             let mut out = Vec::new();
             while let Some(r) = rows.next()? {
                 let mut obj = Map::new();
-                for (i, name) in names.iter().enumerate() {
-                    obj.insert(name.clone(), to_json(r.get_ref(i)?));
+                for (i, (name, is_bool)) in cols.iter().enumerate() {
+                    obj.insert(name.clone(), to_json(r.get_ref(i)?, *is_bool));
                 }
                 out.push(Value::Object(obj));
             }
@@ -332,25 +338,14 @@ impl Db {
     }
 }
 
-fn to_json(v: ValueRef<'_>) -> Value {
+fn to_json(v: ValueRef<'_>, is_bool: bool) -> Value {
     match v {
         ValueRef::Null => Value::Null,
-        ValueRef::Boolean(b) => json!(b),
-        ValueRef::TinyInt(i) => json!(i),
-        ValueRef::SmallInt(i) => json!(i),
-        ValueRef::Int(i) => json!(i),
-        ValueRef::BigInt(i) => json!(i),
-        // Large integers as strings: JSON numbers lose precision above 2^53.
-        ValueRef::HugeInt(i) => json!(i.to_string()),
-        ValueRef::UHugeInt(i) => json!(i.to_string()),
-        ValueRef::UTinyInt(i) => json!(i),
-        ValueRef::USmallInt(i) => json!(i),
-        ValueRef::UInt(i) => json!(i),
-        ValueRef::UBigInt(i) => json!(i),
-        ValueRef::Float(f) => json!(f),
-        ValueRef::Double(f) => json!(f),
+        ValueRef::Integer(i) if is_bool => json!(i != 0),
+        ValueRef::Integer(i) => json!(i),
+        ValueRef::Real(f) => json!(f),
         ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
-        other => json!(format!("{other:?}")),
+        ValueRef::Blob(b) => json!(alloy::hex::encode_prefixed(b)),
     }
 }
 
@@ -455,6 +450,31 @@ mod tests {
         }
         let rows = db.query_json("SELECT count(*) AS n FROM swaps", vec![]).await.unwrap();
         assert_eq!(rows[0]["n"], 1);
+    }
+
+    #[tokio::test]
+    async fn boolean_columns_are_json_bools() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_event(
+            EventTable::Swaps,
+            vec![
+                Box::new(1i64),
+                Box::new(0i32),
+                Box::new("0x".to_string()),
+                Box::new(5i64),
+                Box::new(false),
+                Box::new("10".to_string()),
+                Box::new("9".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        let rows = db
+            .query_json("SELECT zero_for_one, block FROM swaps", vec![])
+            .await
+            .unwrap();
+        assert_eq!(rows[0]["zero_for_one"], false);
+        assert_eq!(rows[0]["block"], 1);
     }
 
     #[tokio::test]

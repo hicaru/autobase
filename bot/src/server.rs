@@ -185,8 +185,8 @@ async fn rewards(State(s): State<AppState>, Query(q): Query<Period>) -> Response
     let since = now_secs() as i64 - days * 86_400;
     let daily =
         s.db.query_json(
-            "SELECT (ts // 86400) * 86400 AS day, sum(accrued_fees_value1) AS fees_value1,
-                    avg(tvl_value1) AS avg_tvl_value1, bool_and(in_range) AS always_in_range
+            "SELECT (ts / 86400) * 86400 AS day, sum(accrued_fees_value1) AS fees_value1,
+                    avg(tvl_value1) AS avg_tvl_value1, min(in_range) AS always_in_range
              FROM snapshots WHERE ts >= ? GROUP BY day ORDER BY day",
             vec![since],
         )
@@ -216,7 +216,11 @@ async fn rewards(State(s): State<AppState>, Query(q): Query<Period>) -> Response
         )
         .await;
     match (daily, totals, gas, rebal) {
-        (Ok(daily), Ok(t), Ok(g), Ok(r)) => {
+        (Ok(mut daily), Ok(t), Ok(g), Ok(r)) => {
+            // SQLite aggregates booleans as 0/1.
+            for d in &mut daily {
+                d["always_in_range"] = json!(d["always_in_range"].as_i64() == Some(1));
+            }
             let t = &t[0];
             let fees = t["fees_value1"].as_f64().unwrap_or(0.0);
             let tvl = t["avg_tvl_value1"].as_f64().unwrap_or(0.0);
@@ -299,13 +303,19 @@ async fn price_history(State(s): State<AppState>, Query(r): Query<Range>) -> Res
     match s
         .db
         .query_json(
-            "SELECT ts, block, tick, pow(1.0001, tick) AS price FROM price_samples
-             WHERE ts >= ? AND ts <= ? ORDER BY ts LIMIT 5000",
+            "SELECT ts, block, tick FROM price_samples WHERE ts >= ? AND ts <= ? ORDER BY ts LIMIT 5000",
             vec![from, to],
         )
         .await
     {
-        Ok(rows) => Json(json!({ "items": rows })).into_response(),
+        Ok(mut rows) => {
+            // Bundled SQLite has no math functions; price = 1.0001^tick is computed here.
+            for r in &mut rows {
+                let tick = r["tick"].as_i64().unwrap_or(0) as i32;
+                r["price"] = json!(1.0001f64.powi(tick));
+            }
+            Json(json!({ "items": rows })).into_response()
+        }
         Err(e) => internal(e),
     }
 }

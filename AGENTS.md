@@ -276,7 +276,7 @@ bot/src/keeper.rs     decision loop (read → decide → eth_call simulate → s
 bot/src/strategy.rs   pure: volatility → width, trigger mirror, decision rules
 bot/src/fees.rs       pure: Uniswap fee-growth math (pending/accrued fees)
 bot/src/indexer.rs    event tailing, hourly prices (archive backfill), snapshots
-bot/src/db.rs         DuckDB (static SQL + bound params only)
+bot/src/db.rs         SQLite (static SQL + bound params only)
 bot/src/server.rs     JSON API (bearer auth, rate limit)
 ```
 
