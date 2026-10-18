@@ -37,6 +37,15 @@ Constructor: `(keeper, factory, tokenA, tokenB, fee, Params)`, deployer = owner.
 | `minRebalanceInterval` / `depositLock` | 1 h / 1 h |
 | `minDepositValue` | `$MIN_DEPOSIT_VALUE` |
 
+## Deployed (mainnet)
+
+| | Address |
+|---|---|
+| Vault `AutoBaseVault` | [`0xb68852E2B545CDC8ec9B4ADEe72c029DB3635958`](https://etherscan.io/address/0xb68852E2B545CDC8ec9B4ADEe72c029DB3635958) |
+| Pool (WBTC/XAUT 0.3%) | [`0xE8a1F39C16EEA2844E98f951D711Bb4Bb31557aD`](https://etherscan.io/address/0xE8a1F39C16EEA2844E98f951D711Bb4Bb31557aD) |
+| Owner / deployer | `0xce883ef8803f2d021106C6510FA28E7b301Cdd87` |
+| Deploy tx | `0x9997f67971fcb0e78321c54692b515ff76f44242c8327a46227d3a94ef812910` (block 26221220) |
+
 ## Keeper bot (`bot/`)
 
 Rust service that watches the vault and calls `rebalance()`:
