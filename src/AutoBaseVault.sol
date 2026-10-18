@@ -83,9 +83,17 @@ contract AutoBaseVault is
     ///      rounding on dust would trip the slippage check. Assumes both tokens have >= 6 decimals.
     uint256 internal constant MIN_SWAP_OUT = 1_000;
 
+    // public getter names pool()/token0()/token1()/tickSpacing() are the vault ABI (bot, Uniswap convention)
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IUniswapV3Pool public immutable pool;
+    // public getter names pool()/token0()/token1()/tickSpacing() are the vault ABI (bot, Uniswap convention)
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IERC20 public immutable token0;
+    // public getter names pool()/token0()/token1()/tickSpacing() are the vault ABI (bot, Uniswap convention)
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IERC20 public immutable token1;
+    // public getter names pool()/token0()/token1()/tickSpacing() are the vault ABI (bot, Uniswap convention)
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
     int24 public immutable tickSpacing;
 
     address public keeper;
@@ -146,12 +154,12 @@ contract AutoBaseVault is
     error UnauthorizedCallback();
 
     modifier onlyKeeper() {
-        if (msg.sender != keeper) revert NotKeeper();
+        _onlyKeeper();
         _;
     }
 
     modifier checkDeadline(uint256 deadline) {
-        if (block.timestamp > deadline) revert Expired();
+        _checkDeadline(deadline);
         _;
     }
 
@@ -354,6 +362,14 @@ contract AutoBaseVault is
     // ------------------------------------------------------------------
     // Internal
     // ------------------------------------------------------------------
+
+    function _onlyKeeper() internal view {
+        if (msg.sender != keeper) revert NotKeeper();
+    }
+
+    function _checkDeadline(uint256 deadline) internal view {
+        if (block.timestamp > deadline) revert Expired();
+    }
 
     function _setKeeper(address keeper_) internal {
         if (keeper_ == address(0)) revert ZeroAddress();

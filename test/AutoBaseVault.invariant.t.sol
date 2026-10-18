@@ -18,9 +18,9 @@ contract VaultHandler is Test {
     address internal constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
     address internal constant XAUT = 0x68749665FF8D2d112Fa859AA293F07A622782F38;
 
-    AutoBaseVault public immutable vault;
-    IUniswapV3Pool public immutable pool;
-    address public immutable keeper;
+    AutoBaseVault public immutable VAULT;
+    IUniswapV3Pool public immutable POOL;
+    address public immutable KEEPER;
     address[3] public users;
 
     /// @dev Set if a withdraw that should have succeeded reverted.
@@ -32,9 +32,9 @@ contract VaultHandler is Test {
     bool internal inSwap;
 
     constructor(AutoBaseVault vault_, address keeper_) {
-        vault = vault_;
-        pool = vault_.pool();
-        keeper = keeper_;
+        VAULT = vault_;
+        POOL = vault_.pool();
+        KEEPER = keeper_;
         users = [makeAddr("u0"), makeAddr("u1"), makeAddr("u2")];
         deal(WBTC, address(this), 1_000e8);
         deal(XAUT, address(this), 100_000e6);
@@ -52,10 +52,10 @@ contract VaultHandler is Test {
         deal(WBTC, user, a0);
         deal(XAUT, user, a1);
         vm.startPrank(user);
-        IERC20(WBTC).forceApprove(address(vault), a0);
-        IERC20(XAUT).forceApprove(address(vault), a1);
+        IERC20(WBTC).forceApprove(address(VAULT), a0);
+        IERC20(XAUT).forceApprove(address(VAULT), a1);
         // May legitimately revert: TWAP deviation after a market move, or below min deposit.
-        try vault.deposit(a0, a1, 0, block.timestamp) {
+        try VAULT.deposit(a0, a1, 0, block.timestamp) {
             ++deposits;
         } catch {}
         vm.stopPrank();
@@ -63,13 +63,13 @@ contract VaultHandler is Test {
 
     function withdraw(uint256 userSeed, uint256 pct) external {
         address user = users[userSeed % 3];
-        uint256 bal = vault.balanceOf(user);
-        if (bal == 0 || block.timestamp < vault.lockedUntil(user)) return;
+        uint256 bal = VAULT.balanceOf(user);
+        if (bal == 0 || block.timestamp < VAULT.lockedUntil(user)) return;
         uint256 shares = bal * bound(pct, 1, 100) / 100;
         if (shares == 0) return;
         vm.prank(user);
         // Must never revert for an unlocked holder.
-        try vault.withdraw(shares, 0, 0, block.timestamp) {
+        try VAULT.withdraw(shares, 0, 0, block.timestamp) {
             ++withdrawals;
         } catch (bytes memory err) {
             withdrawFailed = true;
@@ -79,19 +79,19 @@ contract VaultHandler is Test {
 
     function rebalance(int24 width) external {
         width = int24(bound(width, 60, 1800));
-        vm.prank(keeper);
-        try vault.rebalance(width, 0, block.timestamp) {
+        vm.prank(KEEPER);
+        try VAULT.rebalance(width, 0, block.timestamp) {
             ++rebalances;
         } catch {}
     }
 
     function marketSwap(int24 ticks) external {
         ticks = int24(bound(ticks, -150, 150));
-        (, int24 tick,,,,,) = pool.slot0();
+        (, int24 tick,,,,,) = POOL.slot0();
         int24 target = tick + ticks;
         if (target == tick) return;
         inSwap = true;
-        pool.swap(address(this), target < tick, type(int128).max, TickMath.getSqrtRatioAtTick(target), "");
+        POOL.swap(address(this), target < tick, type(int128).max, TickMath.getSqrtRatioAtTick(target), "");
         inSwap = false;
     }
 
@@ -102,7 +102,7 @@ contract VaultHandler is Test {
     }
 
     function uniswapV3SwapCallback(int256 d0, int256 d1, bytes calldata) external {
-        require(inSwap && msg.sender == address(pool), "cb");
+        require(inSwap && msg.sender == address(POOL), "cb");
         if (d0 > 0) IERC20(WBTC).safeTransfer(msg.sender, SafeCast.toUint256(d0));
         if (d1 > 0) IERC20(XAUT).safeTransfer(msg.sender, SafeCast.toUint256(d1));
     }
