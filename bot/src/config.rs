@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(
         long,
         env = "FALLBACK_RPCS",
-        default_value = "https://eth.drpc.org,https://ethereum-rpc.publicnode.com,https://1rpc.io/eth,https://rpc.flashbots.net"
+        default_value = "https://eth.drpc.org,https://ethereum-rpc.publicnode.com,https://1rpc.io/eth,https://rpc.flashbots.net,https://ethereum.reth.rs/rpc"
     )]
     pub fallback_rpcs: String,
 
